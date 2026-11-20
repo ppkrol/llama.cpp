@@ -988,6 +988,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_argmax_f32;
     vk_pipeline pipeline_count_equal_i32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
+    vk_pipeline pipeline_depth_mix_f32;
+    vk_pipeline pipeline_loop_gate_f32;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
@@ -1007,6 +1009,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_snake_f16;
     vk_pipeline pipeline_snake_bf16;
     vk_pipeline pipeline_pool1d_f32;
+    vk_pipeline pipeline_pool1d_rows_f32;
     vk_pipeline pipeline_pool2d_f32;
     vk_pipeline pipeline_pool2d_subgroup_f32;
     vk_pipeline pipeline_rwkv_wkv6_f32;

@@ -1,0 +1,65 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// GGML_OP_LOOP_GATE: 16 lanes per output channel i of token t (workgroup y) share the two weight rows:
+//   d[i, t] = (1 - tanh(forget[:, i] . h[:, t])) * cur[i, t] + tanh(gain[:, i] . h[:, t]) * msg[i, t]
+
+#define BLOCK 256
+#define LANES 16
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint r; uint n; uint n_tokens;
+    uint nbh1; uint nbg1; uint nbf1; uint nbc1; uint nbm1; uint nbd1;
+    uint h_offset; uint g_offset; uint f_offset; uint c_offset; uint m_offset; uint d_offset;
+} p;
+
+layout(binding = 0) readonly  buffer H {float data_h[];};
+layout(binding = 1) readonly  buffer G {float data_g[];};
+layout(binding = 2) readonly  buffer F {float data_f[];};
+layout(binding = 3) readonly  buffer C {float data_c[];};
+layout(binding = 4) readonly  buffer M {float data_m[];};
+layout(binding = 5) writeonly buffer D {float data_d[];};
+
+shared float hs[256];
+
+float safe_tanh(float x) {
+    return 1.0 - 2.0 / (exp(2.0 * x) + 1.0);
+}
+
+void main() {
+    const uint t    = gl_WorkGroupID.y;
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint i    = gl_WorkGroupID.x * (BLOCK / LANES) + tid / LANES;
+    const uint lane = tid % LANES;
+
+    for (uint j = tid; j < p.r; j += BLOCK) {
+        hs[j] = data_h[p.h_offset + t*p.nbh1 + j];
+    }
+    barrier();
+
+    float g = 0.0;
+    float f = 0.0;
+    if (i < p.n) {
+        const uint gb = p.g_offset + i*p.nbg1;
+        const uint fb = p.f_offset + i*p.nbf1;
+        for (uint j = lane; j < p.r; j += LANES) {
+            g += data_g[gb + j] * hs[j];
+            f += data_f[fb + j] * hs[j];
+        }
+    }
+    // every lane takes part in the shuffles
+    for (uint o = LANES / 2; o > 0; o >>= 1) {
+        g += subgroupShuffleXor(g, o);
+        f += subgroupShuffleXor(f, o);
+    }
+
+    if (lane == 0 && i < p.n) {
+        const float c = data_c[p.c_offset + t*p.nbc1 + i];
+        const float m = data_m[p.m_offset + t*p.nbm1 + i];
+        data_d[p.d_offset + t*p.nbd1 + i] = (1.0 - safe_tanh(f)) * c + safe_tanh(g) * m;
+    }
+}

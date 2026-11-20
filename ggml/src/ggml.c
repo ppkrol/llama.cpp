@@ -1099,6 +1099,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "DEPTH_MIX",
+    "LOOP_GATE",
 
     "UNARY",
 
@@ -1118,7 +1120,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,6 +1216,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "depth_mix(query, cur, blocks)",
+    "loop_gate(h, gain, forget, cur, msg)",
 
     "unary(x)",
 
@@ -1233,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6414,6 +6418,78 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_depth_mix
+
+struct ggml_tensor * ggml_depth_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * query,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * blocks,
+        float                 eps,
+        float                 scale) {
+    GGML_ASSERT(query->type == GGML_TYPE_F32 && cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(!blocks || blocks->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = query->ne[0];
+    const int64_t n_q      = query->ne[1];
+    const int64_t n_tokens = cur->ne[1];
+
+    GGML_ASSERT(query->ne[2] == 1 && query->ne[3] == 1 && query->nb[0] == sizeof(float));
+    GGML_ASSERT(cur->ne[0] == n_embd && cur->ne[2] == 1 && cur->ne[3] == 1 && cur->nb[0] == sizeof(float));
+    if (blocks) {
+        GGML_ASSERT(blocks->ne[0] == n_embd && blocks->ne[2] == n_tokens && blocks->ne[3] == 1 && blocks->nb[0] == sizeof(float));
+        GGML_ASSERT(blocks->ne[1] + 1 <= 8);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_q, n_tokens);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_f32(result, 1, scale);
+
+    result->op     = GGML_OP_DEPTH_MIX;
+    result->src[0] = query;
+    result->src[1] = cur;
+    result->src[2] = blocks;
+
+    return result;
+}
+
+// ggml_loop_gate
+
+struct ggml_tensor * ggml_loop_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * h,
+        struct ggml_tensor  * gain,
+        struct ggml_tensor  * forget,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * msg) {
+    GGML_ASSERT(h->type == GGML_TYPE_F32 && gain->type == GGML_TYPE_F32 && forget->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && msg->type == GGML_TYPE_F32);
+
+    const int64_t r        = h->ne[0];
+    const int64_t n_tokens = h->ne[1];
+    const int64_t n        = gain->ne[1];
+
+    GGML_ASSERT(r <= 256);
+    GGML_ASSERT(ggml_is_contiguous(h) && ggml_is_contiguous(gain) && ggml_is_contiguous(forget));
+    GGML_ASSERT(h->ne[2] == 1 && h->ne[3] == 1);
+    GGML_ASSERT(gain->ne[0] == r && forget->ne[0] == r && forget->ne[1] == n);
+    GGML_ASSERT(gain->ne[2] == 1 && gain->ne[3] == 1 && forget->ne[2] == 1 && forget->ne[3] == 1);
+    GGML_ASSERT(cur->ne[0] == n && cur->ne[1] == n_tokens && cur->ne[2] == 1 && cur->ne[3] == 1 && cur->nb[0] == sizeof(float));
+    GGML_ASSERT(msg->ne[0] == n && msg->ne[1] == n_tokens && msg->ne[2] == 1 && msg->ne[3] == 1 && msg->nb[0] == sizeof(float));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+
+    result->op     = GGML_OP_LOOP_GATE;
+    result->src[0] = h;
+    result->src[1] = gain;
+    result->src[2] = forget;
+    result->src[3] = cur;
+    result->src[4] = msg;
 
     return result;
 }

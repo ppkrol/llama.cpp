@@ -415,6 +415,8 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_DEPTH_MIX,
+        GGML_OP_LOOP_GATE,
 
         GGML_OP_UNARY,
 
@@ -2459,6 +2461,30 @@ extern "C" {
     //                         + base[2*hc + dst + hc*src]
     // Softmax over dst, add eps, normalize over src, then repeat normalization
     // over dst followed by src for iterations 1 through n_iter - 1.
+    // depth mix (inkling2 attention residuals): per token and query, a softmax over rms-normalized states
+    //   states of token t: blocks[:, s, t] (s < k, blocks optional) and cur[:, t]
+    //   x_s = state_s / sqrt(mean(state_s^2) + eps), score_s = scale * dot(query[:, q], x_s)
+    //   result[:, q, t] = sum_s softmax(score)_s * x_s
+    // query [n_embd, n_q], cur [n_embd, n_tokens], blocks [n_embd, k, n_tokens] (k <= 7) or NULL -> [n_embd, n_q, n_tokens]
+    GGML_API struct ggml_tensor * ggml_depth_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * query,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * blocks,
+            float                 eps,
+            float                 scale);
+
+    // loop gate (inkling2 loop message controller):
+    //   result[i, t] = (1 - tanh(sum_j forget[j, i]*h[j, t]))*cur[i, t] + tanh(sum_j gain[j, i]*h[j, t])*msg[i, t]
+    // h [r, n_tokens], gain/forget [r, n] (as for ggml_mul_mat(gain, h)), cur/msg [n, n_tokens] -> [n, n_tokens]
+    GGML_API struct ggml_tensor * ggml_loop_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * h,
+            struct ggml_tensor  * gain,
+            struct ggml_tensor  * forget,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg);
+
     GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
             struct ggml_context * ctx,
             struct ggml_tensor  * mixes,

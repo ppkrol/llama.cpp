@@ -11344,6 +11344,104 @@ void ggml_compute_forward_gated_delta_net(
 }
 
 
+// ggml_compute_forward_loop_gate
+
+void ggml_compute_forward_loop_gate(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * h      = dst->src[0];
+    const ggml_tensor * gain   = dst->src[1];
+    const ggml_tensor * forget = dst->src[2];
+    const ggml_tensor * cur    = dst->src[3];
+    const ggml_tensor * msg    = dst->src[4];
+
+    const int64_t r        = h->ne[0];
+    const int64_t n_tokens = h->ne[1];
+    const int64_t n        = gain->ne[1];
+
+    for (int64_t idx = params->ith; idx < n*n_tokens; idx += params->nth) {
+        const int64_t i = idx % n;
+        const int64_t t = idx / n;
+        const float * hv = (const float *) ((const char *) h->data + t*h->nb[1]);
+        const float * wg = (const float *) ((const char *) gain->data + i*gain->nb[1]);
+        const float * wf = (const float *) ((const char *) forget->data + i*forget->nb[1]);
+        float g = 0.0f;
+        float f = 0.0f;
+        for (int64_t j = 0; j < r; ++j) {
+            g += wg[j]*hv[j];
+            f += wf[j]*hv[j];
+        }
+        const float c = *(const float *) ((const char *) cur->data + i*sizeof(float) + t*cur->nb[1]);
+        const float m = *(const float *) ((const char *) msg->data + i*sizeof(float) + t*msg->nb[1]);
+        *(float *) ((char *) dst->data + i*sizeof(float) + t*dst->nb[1]) = (1.0f - tanhf(f))*c + tanhf(g)*m;
+    }
+}
+
+// ggml_compute_forward_depth_mix
+
+void ggml_compute_forward_depth_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * query  = dst->src[0];
+    const ggml_tensor * cur    = dst->src[1];
+    const ggml_tensor * blocks = dst->src[2];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const float eps   = ggml_get_op_params_f32(dst, 0);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n_embd   = query->ne[0];
+    const int64_t n_q      = query->ne[1];
+    const int64_t n_tokens = cur->ne[1];
+    const int64_t k        = blocks ? blocks->ne[1] : 0;
+    const int64_t n_states = k + 1;
+
+    float r[8];
+    float w[8];
+    const float * xs[8];
+
+    for (int64_t row = params->ith; row < n_q*n_tokens; row += params->nth) {
+        const int64_t q = row % n_q;
+        const int64_t t = row / n_q;
+
+        const float * qv = (const float *) ((const char *) query->data + q*query->nb[1]);
+
+        float w_max = -INFINITY;
+        for (int64_t s = 0; s < n_states; ++s) {
+            xs[s] = s < k ? (const float *) ((const char *) blocks->data + s*blocks->nb[1] + t*blocks->nb[2])
+                          : (const float *) ((const char *) cur->data + t*cur->nb[1]);
+            ggml_float sum_sq = 0.0;
+            ggml_float dot    = 0.0;
+            for (int64_t e = 0; e < n_embd; ++e) {
+                sum_sq += (ggml_float) (xs[s][e]*xs[s][e]);
+                dot    += (ggml_float) (xs[s][e]*qv[e]);
+            }
+            r[s] = 1.0f/sqrtf((float) (sum_sq/n_embd) + eps);
+            w[s] = scale*r[s]*(float) dot;
+            w_max = std::max(w_max, w[s]);
+        }
+
+        float sum = 0.0f;
+        for (int64_t s = 0; s < n_states; ++s) {
+            w[s] = expf(w[s] - w_max);
+            sum += w[s];
+        }
+        for (int64_t s = 0; s < n_states; ++s) {
+            w[s] = w[s]/sum*r[s];
+        }
+
+        float * out = (float *) ((char *) dst->data + q*dst->nb[1] + t*dst->nb[2]);
+        for (int64_t e = 0; e < n_embd; ++e) {
+            float acc = 0.0f;
+            for (int64_t s = 0; s < n_states; ++s) {
+                acc += w[s]*xs[s][e];
+            }
+            out[e] = acc;
+        }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_comb
 
 static void ggml_dsv4_hc_comb_norm_cols(float * comb, float eps) {

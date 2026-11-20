@@ -6933,6 +6933,71 @@ struct test_pool1d : public test_case {
     }
 };
 
+// GGML_OP_LOOP_GATE
+struct test_loop_gate : public test_case {
+    const int64_t r;
+    const int64_t n;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR3(r, n, n_tokens);
+    }
+
+    test_loop_gate(int64_t r = 64, int64_t n = 2304, int64_t n_tokens = 1) : r(r), n(n), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * h      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, n_tokens);
+        ggml_tensor * gain   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, n);
+        ggml_tensor * forget = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, r, n);
+        ggml_tensor * cur    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_tensor * msg    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_set_name(h, "h"); ggml_set_name(gain, "gain"); ggml_set_name(forget, "forget");
+        ggml_set_name(cur, "cur"); ggml_set_name(msg, "msg");
+        ggml_tensor * out = ggml_loop_gate(ctx, h, gain, forget, cur, msg);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_DEPTH_MIX
+struct test_depth_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_q;
+    const int64_t n_tokens;
+    const int64_t k;
+    const bool    query_view;
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, n_q, n_tokens, k, query_view);
+    }
+
+    test_depth_mix(int64_t n_embd = 2304, int64_t n_q = 1, int64_t n_tokens = 1, int64_t k = 2, bool query_view = false)
+        : n_embd(n_embd), n_q(n_q), n_tokens(n_tokens), k(k), query_view(query_view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * query;
+        if (query_view) {
+            // rows 2.. of a larger table, like the loop's per-layer queries
+            ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_q + 2);
+            ggml_set_name(table, "table");
+            query = ggml_view_2d(ctx, table, n_embd, n_q, table->nb[1], 2*table->nb[1]);
+        } else {
+            query = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_q);
+            ggml_set_name(query, "query");
+        }
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * blocks = nullptr;
+        if (k > 0) {
+            blocks = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, k, n_tokens);
+            ggml_set_name(blocks, "blocks");
+        }
+        ggml_tensor * out = ggml_depth_mix(ctx, query, cur, blocks, 1e-6f, 1.0f/sqrtf((float) n_embd));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_CONV_TRANSPOSE_1D
 struct test_conv_transpose_1d : public test_case {
     const std::array<int64_t, 4> ne_input;
@@ -11037,12 +11102,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
             // one window over the whole row (a row reduction)
-            for (int64_t iw : {10, 128, 256, 1000, 2048, 4099}) {
+            for (int64_t iw : {10, 128, 256, 1000, 2048, 4099, 200058}) {
                 test_cases.emplace_back(new test_pool1d(pool_type, type_input, { iw, 3, 2, 1 }, (int) iw, (int) iw, 0));
                 test_cases.emplace_back(new test_pool1d(pool_type, type_input, { iw, 1024, 1, 1 }, (int) iw, (int) iw, 0));
+                if (iw == 256) {
+                    test_cases.emplace_back(new test_pool1d(pool_type, type_input, { iw, 70001, 1, 1 }, (int) iw, (int) iw, 0)); // > 65535 workgroups
+                }
             }
         }
     }
+
+    for (int64_t k : {0, 1, 2, 4, 7}) {
+        for (int64_t n_tokens : {1, 3, 70}) {
+            test_cases.emplace_back(new test_depth_mix(2304, 1, n_tokens, k));
+            test_cases.emplace_back(new test_depth_mix(2304, 3, n_tokens, k));
+        }
+    }
+    test_cases.emplace_back(new test_depth_mix(2304, 2, 5, 3, true));
+    for (int64_t n_tokens : {1, 4, 77}) {
+        test_cases.emplace_back(new test_loop_gate(64, 2304, n_tokens));
+        test_cases.emplace_back(new test_loop_gate(64, 100, n_tokens));
+    }
+    test_cases.emplace_back(new test_loop_gate(200, 300, 3));
+    test_cases.emplace_back(new test_depth_mix(100, 2, 4, 2));
+    test_cases.emplace_back(new test_depth_mix(2304, 1, 22000, 1)); // > 65535 workgroups with n_q = 3 below
+    test_cases.emplace_back(new test_depth_mix(2304, 3, 22000, 1));
 
 #if 0
     // >4GB im2col destination. Too slow to run by default.

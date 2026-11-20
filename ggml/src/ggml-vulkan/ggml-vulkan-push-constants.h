@@ -200,6 +200,19 @@ struct vk_op_fwht_push_constants {
     float scale;
 };
 
+struct vk_op_loop_gate_push_constants {
+    uint32_t r; uint32_t n; uint32_t n_tokens;
+    uint32_t nbh1; uint32_t nbg1; uint32_t nbf1; uint32_t nbc1; uint32_t nbm1; uint32_t nbd1;
+    uint32_t h_offset; uint32_t g_offset; uint32_t f_offset; uint32_t c_offset; uint32_t m_offset; uint32_t d_offset;
+};
+
+struct vk_op_depth_mix_push_constants {
+    uint32_t n_embd; uint32_t n_q; uint32_t n_tokens; uint32_t k;
+    uint32_t nbq1; uint32_t nbc1; uint32_t nbb1; uint32_t nbb2; uint32_t nbd1; uint32_t nbd2;
+    uint32_t q_offset; uint32_t c_offset; uint32_t b_offset; uint32_t d_offset;
+    float eps; float scale;
+};
+
 struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t n_tokens;
 
@@ -1039,6 +1052,15 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
 
     GGML_UNUSED(src1);
     GGML_UNUSED(src2);
+    GGML_UNUSED(src3);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_depth_mix_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.q_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.c_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.b_offset = get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type);
+    p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+
     GGML_UNUSED(src3);
 }
 

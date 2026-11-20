@@ -4054,6 +4054,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // comb holds a token's 4x4 matrix in one 16-lane slice of a subgroup, so it
     // needs at least 16 lanes, pinned to a known size.
     if (device->subgroup_basic && device->subgroup_shuffle && device->subgroup_require_full_support && device->subgroup_size >= 16) {
+        // 16 lanes per output reduce by subgroupShuffleXor: lanes of one output must share a full subgroup
+        ggml_vk_create_pipeline(device, device->pipeline_loop_gate_f32, "loop_gate_f32", loop_gate_f32_len, loop_gate_f32_data, "main", 6, sizeof(vk_op_loop_gate_push_constants), {16, 1, 1}, {}, 1, true, true, device->subgroup_size);
+    }
+    if (device->subgroup_arithmetic && device->subgroup_size >= 16) {
+        ggml_vk_create_pipeline(device, device->pipeline_depth_mix_f32, "depth_mix_f32", depth_mix_f32_len, depth_mix_f32_data, "main", 4, sizeof(vk_op_depth_mix_push_constants), {1, 1, 1}, {}, 1);
+    }
+    if (device->subgroup_basic && device->subgroup_shuffle && device->subgroup_require_full_support && device->subgroup_size >= 16) {
         const uint32_t tokens_per_workgroup = 4 * (device->subgroup_size / 16);
         ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_comb_push_constants), {tokens_per_workgroup, 1, 1}, { device->subgroup_size }, 1, true, true, device->subgroup_size);
     }
@@ -4106,6 +4113,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_snake_bf16, "snake_bf16", snake_bf16_len, snake_bf16_data, "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_pool1d_f32, "pool1d_f32", pool1d_f32_len, pool1d_f32_data, "main", 2, sizeof(vk_op_pool1d_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_pool1d_rows_f32, "pool1d_rows_f32", pool1d_rows_f32_len, pool1d_rows_f32_data, "main", 2, sizeof(vk_op_pool1d_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {1, 1, 1}, {512}, 1);
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_pool2d_subgroup_f32, "pool2d_subgroup_f32", pool2d_subgroup_f32_len, pool2d_subgroup_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {1, 1, 1}, {128}, 1, false, true, device->subgroup_size);
@@ -4829,7 +4837,7 @@ vk_device ggml_vk_get_device(size_t idx) {
                                 (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote);
 
         // Submit at least every 100 nodes, in case there are workloads without as much matmul.
-        device->max_nodes_per_submit = 100;
+        device->max_nodes_per_submit = 1000; // local: 100 -> 1000, +4% tok/s on Inkling (8100-node graphs)
         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
         if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
@@ -8039,6 +8047,74 @@ static uint32_t ggml_vk_nb_elem(const ggml_tensor * t, int i) {
     return (uint32_t)(t->nb[i] / ggml_type_size(t->type));
 }
 
+static void ggml_vk_loop_gate(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * h      = dst->src[0];
+    const ggml_tensor * gain   = dst->src[1];
+    const ggml_tensor * forget = dst->src[2];
+    const ggml_tensor * cur    = dst->src[3];
+    const ggml_tensor * msg    = dst->src[4];
+
+    vk_pipeline pipeline = ctx->device->pipeline_loop_gate_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer h_buf = ggml_vk_tensor_subbuffer(ctx, h,      true);
+    const vk_subbuffer g_buf = ggml_vk_tensor_subbuffer(ctx, gain,   true);
+    const vk_subbuffer f_buf = ggml_vk_tensor_subbuffer(ctx, forget, true);
+    const vk_subbuffer c_buf = ggml_vk_tensor_subbuffer(ctx, cur,    true);
+    const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, msg,    true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,    true);
+
+    const uint32_t n        = (uint32_t)gain->ne[1];
+    const uint32_t n_tokens = (uint32_t)h->ne[1];
+
+    vk_op_loop_gate_push_constants pc = {
+        (uint32_t)h->ne[0], n, n_tokens,
+        ggml_vk_nb_elem(h, 1), ggml_vk_nb_elem(gain, 1), ggml_vk_nb_elem(forget, 1),
+        ggml_vk_nb_elem(cur, 1), ggml_vk_nb_elem(msg, 1), ggml_vk_nb_elem(dst, 1),
+        get_misalign_bytes(ctx, h)      / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, gain)   / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, forget) / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, cur)    / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, msg)    / (uint32_t)sizeof(float),
+        get_misalign_bytes(ctx, dst)    / (uint32_t)sizeof(float),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { h_buf, g_buf, f_buf, c_buf, m_buf, d_buf }, pc, { n, n_tokens, 1 });
+}
+
+static void ggml_vk_depth_mix(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * query, const ggml_tensor * cur, const ggml_tensor * blocks, ggml_tensor * dst) {
+    vk_pipeline pipeline = ctx->device->pipeline_depth_mix_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    const uint32_t n_q      = (uint32_t)query->ne[1];
+    const uint32_t n_tokens = (uint32_t)cur->ne[1];
+    const uint32_t k        = blocks ? (uint32_t)blocks->ne[1] : 0;
+    // without blocks the shader never reads binding 2: bind cur there
+    const ggml_tensor * blk = blocks ? blocks : cur;
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, query, true);
+    const vk_subbuffer c_buf = ggml_vk_tensor_subbuffer(ctx, cur,   true);
+    const vk_subbuffer b_buf = ggml_vk_tensor_subbuffer(ctx, blk,   true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,   true);
+
+    vk_op_depth_mix_push_constants pc = {
+        (uint32_t)query->ne[0], n_q, n_tokens, k,
+        ggml_vk_nb_elem(query, 1), ggml_vk_nb_elem(cur, 1), ggml_vk_nb_elem(blk, 1), ggml_vk_nb_elem(blk, 2),
+        ggml_vk_nb_elem(dst, 1), ggml_vk_nb_elem(dst, 2),
+        0, 0, 0, 0,
+        ggml_get_op_params_f32(dst, 0), ggml_get_op_params_f32(dst, 1),
+    };
+    init_pushconst_tensor_offsets(ctx, pc, query, cur, blk, nullptr, dst);
+
+    const uint32_t rows = n_q * n_tokens;
+    const std::array<uint32_t, 3> elements = rows > 65535 ? std::array<uint32_t, 3>{ 65535, CEIL_DIV(rows, 65535u), 1 } : std::array<uint32_t, 3>{ rows, 1, 1 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, c_buf, b_buf, d_buf }, pc, elements);
+}
+
 void ggml_vk_dsv4_hc_comb(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * mixes, const ggml_tensor * scale, const ggml_tensor * base, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_dsv4_hc_comb(" << mixes << ", " << scale << ", " << base << ", " << dst << ")");
 
@@ -9751,6 +9827,9 @@ static uint32_t ggml_vk_float_type_idx(ggml_type type) {
     return type == GGML_TYPE_BF16 ? 2 : type == GGML_TYPE_F16 ? 1 : 0;
 }
 
+// POOL_1D windows at least this wide use pool1d_rows (a workgroup per output)
+static constexpr int32_t GGML_VK_POOL1D_ROWS_MIN_WINDOW = 256;
+
 static bool ggml_vk_is_float_elementwise(const ggml_tensor * op) {
     return ggml_vk_is_float_type(op->type) && op->src[0]->type == op->type;
 }
@@ -10178,6 +10257,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
     case GGML_OP_POOL_1D:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            // wide windows (e.g. a max over a whole vocab row): one workgroup per output instead of one thread
+            if (dst->op_params[1] >= GGML_VK_POOL1D_ROWS_MIN_WINDOW) {
+                return ctx->device->pipeline_pool1d_rows_f32;
+            }
             return ctx->device->pipeline_pool1d_f32;
         }
         return nullptr;
@@ -10623,6 +10706,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             const uint32_t OC = dst->ne[1];
             const uint32_t OL = dst->ne[0];
             elements = { N * OC * OL, 1, 1};
+            if (pipeline == ctx->device->pipeline_pool1d_rows_f32 && elements[0] > 65535) {
+                // one workgroup per output: spread them over x and y (the shader rebuilds the index)
+                elements = { 65535, CEIL_DIV(elements[0], 65535u), 1 };
+            }
         } break;
     case GGML_OP_POOL_2D:
         {
@@ -13762,6 +13849,14 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         ggml_vk_dsv4_hc_comb(ctx, compute_ctx, src0, src1, src2, node);
 
         break;
+    case GGML_OP_DEPTH_MIX:
+        ggml_vk_depth_mix(ctx, compute_ctx, src0, src1, src2, node);
+
+        break;
+    case GGML_OP_LOOP_GATE:
+        ggml_vk_loop_gate(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_DSV4_HC_PRE:
         ggml_vk_dsv4_hc_pre(ctx, compute_ctx, src0, src1, node);
 
@@ -16111,7 +16206,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         // that we support (e.g. RMS_NORM + MUL).
         // This first pass only grabs "real" (non-view nodes). Second pass grabs view nodes.
         // The goal is to not interleave real and view nodes in a way that breaks fusion.
-        const int NUM_TO_CHECK = 20;
+        // how far ahead to look for independent nodes to run before the next barrier (GGML_VK_GRAPH_OPT_WINDOW)
+        static const int NUM_TO_CHECK = getenv("GGML_VK_GRAPH_OPT_WINDOW") ? std::max(2, atoi(getenv("GGML_VK_GRAPH_OPT_WINDOW"))) : 20;
         for (int j = first_unused+1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
             if (used[j]) {
                 continue;
@@ -17050,6 +17146,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return false;
             }
+        case GGML_OP_LOOP_GATE:
+            return op->type == GGML_TYPE_F32 && op->src[1]->ne[0] <= 256 && op->src[0]->ne[1] <= 65535 && device->pipeline_loop_gate_f32 != nullptr;
+        case GGML_OP_DEPTH_MIX:
+            return op->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float) &&
+                   (!op->src[2] || op->src[2]->nb[0] == sizeof(float)) && device->pipeline_depth_mix_f32 != nullptr;
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:

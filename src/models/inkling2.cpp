@@ -1,6 +1,48 @@
 #include "models.h"
 #include "../llama-memory-hybrid-iswa.h"
 
+#include "ggml-backend.h"
+
+#include <mutex>
+#include <set>
+#include <vector>
+
+// local: fold a plain short convolution's residual and scale into its weights, once, in device memory:
+// s*(cur + sum_k w[k]*x[t+k]) == sum_k w'[k]*x[t+k] with w' = s*w and w'[last] += s (x[t + n_conv - 1] is cur).
+// Host (mmapped, read-only) weights stay as they are and keep the plain graph. INK_NO_CONV_FOLD=1 turns it off.
+static bool inkling2_fold_conv(ggml_tensor * w, float s) {
+    static std::mutex mtx;
+    static std::set<const ggml_tensor *> folded;
+    static std::set<const ggml_tensor *> kept;
+    static const bool off = getenv("INK_NO_CONV_FOLD") != nullptr;
+    if (off || w->type != GGML_TYPE_F32 || !w->buffer || !w->data) {
+        // no data yet (e.g. a memory-measuring model without weights): plain graph, decide again next time
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    if (folded.count(w)) {
+        return true;
+    }
+    if (kept.count(w)) {
+        return false;
+    }
+    if (ggml_backend_buffer_is_host(w->buffer) || !ggml_is_contiguous(w)) {
+        kept.insert(w);
+        return false;
+    }
+    const int64_t n_conv = w->ne[0];
+    std::vector<float> data(ggml_nelements(w));
+    ggml_backend_tensor_get(w, data.data(), 0, ggml_nbytes(w));
+    for (int64_t c = 0; c < w->ne[1]; ++c) {
+        for (int64_t k = 0; k < n_conv; ++k) {
+            data[c*n_conv + k] = s*data[c*n_conv + k] + (k == n_conv - 1 ? s : 0.0f);
+        }
+    }
+    ggml_backend_tensor_set(w, data.data(), 0, ggml_nbytes(w));
+    folded.insert(w);
+    return true;
+}
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -62,7 +104,8 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
 
     hparams.swa_type                = LLAMA_SWA_TYPE_STANDARD;
     hparams.expert_router_f32       = true;
-    hparams.expert_weights_norm_eps = 1e-20f;
+    // local: 0 = the generic clamp guard instead of +1e-20 (same result for a sum of 8 sigmoids), so Vulkan fuses the router (TOPK_MOE_SIGMOID_NORM_BIAS)
+    hparams.expert_weights_norm_eps = 0.0f;
 
     // no RoPE, the relative-position bias carries the positions
     hparams.rope_pattern.fill(false);
@@ -194,22 +237,47 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const 
     return std::make_unique<graph>(params);
 }
 
+// TEMP speed probe: INK_ABL=mix,conv,ctl,situ skips pieces of the graph (wrong output, timing only)
+static bool ink_abl(const char * name) {
+    static const std::string v = getenv("INK_ABL") ? getenv("INK_ABL") : "";
+    return !v.empty() && ("," + v + ",").find("," + std::string(name) + ",") != std::string::npos;
+}
+
 // scale each row down to an L2 norm of at most threshold, after the optional per-channel scale
 ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold) {
     if (scale) {
         cur = ggml_mul(ctx0, cur, scale);
     }
 
-    ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur)));
-    norm = ggml_scale_bias(ctx0, norm, 1.0f, 1e-6f);
-
-    ggml_tensor * factor = ggml_div(ctx0, ggml_fill(ctx0, norm, threshold), norm);
-
-    return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
+    // x * clamp(T / |x|, 0, 1) == T * x / max(|x|, T): one L2_NORM with eps = T and a scale, instead of 8 small ops
+    return ggml_scale(ctx0, ggml_l2_norm(ctx0, cur, threshold), threshold);
 }
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    if (ink_abl("mix")) {
+        return ggml_repeat(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+    }
+    static const bool old_mix = getenv("INK_OLD_MIX") != nullptr;
+    if (!old_mix && query->type == GGML_TYPE_F32 && blocks.size() + 1 <= 8) {
+        // one DEPTH_MIX op instead of concat + rms_norm + repeat + mul_mat + soft_max + cont + mul_mat
+        // (the state order differs from the concat below: a softmax-weighted sum does not depend on it)
+        ggml_tensor * stacked = nullptr;
+        if (!blocks.empty()) {
+            auto it = mix_stacks.find(blocks);
+            if (it != mix_stacks.end()) {
+                stacked = it->second;
+            } else {
+                for (ggml_tensor * block : blocks) {
+                    ggml_tensor * b = ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens);
+                    stacked = stacked ? ggml_concat(ctx0, stacked, b, 1) : b;
+                }
+                mix_stacks[blocks] = stacked;
+            }
+        }
+        return ggml_depth_mix(ctx0, query, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens), stacked, 1e-6f, 1.0f/sqrtf(n_embd));
+    }
+
     ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     for (ggml_tensor * block : blocks) {
         states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
@@ -226,9 +294,22 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
 
 // loop message controller: (1 - tanh(F h))*cur + tanh(G h)*message, h = D [rms(cur); rms(message)]; module: q, k, v, mlp
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const llama_layer & layer, int module) {
+    if (ink_abl("ctl")) {
+        return cur;
+    }
     ggml_tensor * h = ggml_concat(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), ggml_reshape_3d(ctx0, message, n_embd, 1, n_tokens), 1);
     h = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, h, 1e-6f), 2*n_embd, n_tokens);
     h = build_lora_mm(layer.loop_down[module], h);
+
+    static const bool old_ctl = getenv("INK_OLD_CTL") != nullptr;
+    ggml_tensor * wg = layer.loop_gain[module];
+    ggml_tensor * wf = layer.loop_forget[module];
+    if (!old_ctl && wg->type == GGML_TYPE_F32 && wf->type == GGML_TYPE_F32 && h->ne[0] <= 256 &&
+            cur->ne[1] == n_tokens && message->ne[1] == n_tokens && ggml_n_dims(cur) <= 2 && ggml_n_dims(message) <= 2 &&
+            cur->nb[0] == sizeof(float) && message->nb[0] == sizeof(float)) {
+        // one LOOP_GATE op instead of 2 mul_mat + 2 tanh + scale_bias + 2 mul + add
+        return ggml_loop_gate(ctx0, h, wg, wf, cur, message);
+    }
 
     ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(layer.loop_gain[module],   h));
     ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(layer.loop_forget[module], h));
@@ -246,6 +327,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         ggml_tensor * history,
         llm_graph_input_rs * inp,
         int64_t offset) {
+    if (ink_abl("conv")) {
+        return cur;
+    }
     const int64_t n_conv       = hparams.n_shortconv_l_cache;
     const int64_t n_channels   = cur->ne[0];
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
@@ -257,6 +341,11 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     x = ggml_concat(ctx0, past, x, 0);
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+
+    if (!dynamic && inkling2_fold_conv(weight, 1.0f/sqrtf(n_conv + 1))) {
+        // residual and scale live in the folded weights
+        return ggml_reshape_2d(ctx0, ggml_ssm_conv(ctx0, x, weight), n_channels, n_tokens);
+    }
 
     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
@@ -279,6 +368,9 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
         }
     }
 
+    if (ink_abl("convres")) {
+        return out;
+    }
     return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
 }
 
@@ -474,7 +566,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 layer.ffn_exp_probs_b,
                 hparams.n_expert,
                 hparams.n_expert_used(il),
-                LLM_FFN_SITU, true,
+                ink_abl("situ") ? LLM_FFN_SILU : LLM_FFN_SITU, true,
                 hparams.expert_weights_scale,
                 LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
                 il,
