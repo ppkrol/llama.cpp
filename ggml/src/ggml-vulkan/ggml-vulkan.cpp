@@ -17026,7 +17026,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_SLEEP:
             return device->shader_clock;
         case GGML_OP_SCALE:
-            return ggml_is_contiguous(op->src[0]) && ggml_vk_is_float_elementwise(op);
+            // scale.comp indexes through the strides, so views (e.g. the gate/up halves of a merged gate_up) stay on the GPU
+            return ggml_vk_is_float_elementwise(op);
         case GGML_OP_PAD:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_ROLL:
