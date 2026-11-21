@@ -1,3 +1,6 @@
+> [!NOTE]
+> **This branch:** Inkling 2 Mini on Vulkan, 25 -> 108 tok/s on an RX 7900 XT. Build, run and numbers: [INKLING.md](INKLING.md)
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
