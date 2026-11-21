@@ -1416,6 +1416,13 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
         std::string type = json_value(p, "type", std::string());
         if (type == "image_url") {
             if (!opt.allow_image) {
+                // local: with LLAMA_IMAGE_AS_TEXT set, a picture becomes a short note instead of failing the request
+                // (a text-only model behind Claude Code: one Read of a .png made every later request fail, 2026-11-21)
+                static const bool as_text = getenv("LLAMA_IMAGE_AS_TEXT") != nullptr;
+                if (as_text) {
+                    p = json{{"type", "text"}, {"text", "[An image was here, but this model cannot see images. Ask the user to describe it if it matters.]"}};
+                    continue;
+                }
                 throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
             }
 
