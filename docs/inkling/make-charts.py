@@ -4,13 +4,15 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib import font_manager as fm
 
-for f in glob.glob('/home/v3ngeful/.local/share/fonts/ibm-plex/IBMPlexSans-*.ttf'):
-    fm.fontManager.addfont(f)
-plt.rcParams.update({'font.family': 'IBM Plex Sans', 'font.size': 11})
+import os
+for d in (os.path.expanduser('~/.local/share/fonts'), '/usr/share/fonts'):
+    for f in glob.glob(os.path.join(d, '**', 'IBMPlexSans-*.ttf'), recursive=True):
+        fm.fontManager.addfont(f)
+plt.rcParams.update({'font.family': ['IBM Plex Sans', 'DejaVu Sans'], 'font.size': 11})
 
 BG, FG, DIM, GRID = '#0b0c0f', '#e8eaed', '#8b929c', '#1d2026'
 AZ, DEEP, LIGHT, GREY = '#18a0ff', '#0c6ce0', '#9ad5ff', '#4a505a'
-OUT = '/tmp/inkling-charts/'
+OUT = os.path.dirname(os.path.abspath(__file__)) + '/'
 
 def frame(ax):
     ax.set_facecolor(BG)
