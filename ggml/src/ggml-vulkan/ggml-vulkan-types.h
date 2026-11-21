@@ -813,6 +813,7 @@ struct vk_device_struct {
 
     bool dot2_f16 {};
     bool ocp_fp4 {};
+    bool nvfp4x {};  // local: the dedicated NVFP4 mat-vec shaders are in use (they read MAT_VEC_FUSION_FLAGS_SCALE0_ID)
 
     bool workgroup_memory_explicit_layout {};
     bool workgroup_memory_explicit_layout_16bit {};
@@ -990,6 +991,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_depth_mix_f32;
     vk_pipeline pipeline_loop_gate_f32;
+    vk_pipeline pipeline_clip_norm_f32;
+    vk_pipeline pipeline_conv_step_f32;
+    vk_pipeline pipeline_loop_down_f32;
+    vk_pipeline pipeline_rel_mask_f16m;
+    vk_pipeline pipeline_rel_mask_f32m;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_pre_gated_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
@@ -1163,6 +1169,9 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+
+// local: data_fuse0 is a per-expert table read at the slot's expert id (the GET_ROWS of the table is skipped)
+#define MAT_VEC_FUSION_FLAGS_SCALE0_ID 0x10
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1367,6 +1376,7 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    bool fused_mmid_scale0_id {};  // local: MUL_MAT_ID's fused MUL reads its scale table by expert id
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};

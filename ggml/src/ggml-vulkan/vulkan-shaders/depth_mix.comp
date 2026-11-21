@@ -7,7 +7,7 @@
 // GGML_OP_DEPTH_MIX: one workgroup per (query, token). Each state is rms-normalized, scored against the query,
 // softmaxed over the states and summed with those weights. States: blocks[:, s, t] for s < k, then cur[:, t].
 
-#define BLOCK 1024
+#define BLOCK 512
 #define S_MAX 8
 #define MAX_SUBGROUPS 32
 
@@ -27,7 +27,7 @@ layout(binding = 3) writeonly buffer D {float data_d[];};
 
 shared float red[2*S_MAX][MAX_SUBGROUPS];
 
-void main() {
+void generic_path() {
     // uniform per workgroup: the whole group leaves together, before any barrier
     const uint row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
     if (row >= p.n_q * p.n_tokens) {
@@ -111,5 +111,93 @@ void main() {
             }
         }
         data_d[db + e] = acc;
+    }
+}
+
+// local: decode latency path. Every thread keeps its NE_MAX elements of all S_MAX states in registers, so all loads
+// go out at once (the generic path waited on each state's load in turn: ~1 us per state) and the mix needs no
+// second read. States past n_states load the last block again (always valid) and get weight 0.
+#define NE_MAX ((3072 + BLOCK - 1) / BLOCK)
+
+void main() {
+    if (p.n_embd > NE_MAX * BLOCK) {
+        generic_path();
+        return;
+    }
+    const uint row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    if (row >= p.n_q * p.n_tokens) {
+        return;
+    }
+    const uint q   = row % p.n_q;
+    const uint t   = row / p.n_q;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint n_states = p.k + 1;
+    const uint qb = p.q_offset + q*p.nbq1;
+    const uint bb = p.b_offset + t*p.nbb2;
+    const uint cb = p.c_offset + t*p.nbc1;
+    const uint kl = p.k > 0 ? p.k - 1 : 0;   // last block (without blocks, binding 2 is cur)
+
+    float x[S_MAX][NE_MAX];
+    float qv[NE_MAX];
+    [[unroll]] for (uint i = 0; i < NE_MAX; ++i) {
+        const uint e = min(tid + i*BLOCK, p.n_embd - 1);
+        qv[i] = data_q[qb + e];
+        const float c = data_c[cb + e];
+        [[unroll]] for (uint s = 0; s < S_MAX; ++s) {
+            const float bv = data_b[bb + min(s, kl)*p.nbb1 + e];
+            x[s][i] = s < p.k ? bv : c;
+        }
+    }
+
+    float ss[S_MAX];
+    float dq[S_MAX];
+    [[unroll]] for (uint s = 0; s < S_MAX; ++s) {
+        ss[s] = 0.0;
+        dq[s] = 0.0;
+        [[unroll]] for (uint i = 0; i < NE_MAX; ++i) {
+            const float v = tid + i*BLOCK < p.n_embd ? x[s][i] : 0.0;
+            ss[s] = fma(v, v, ss[s]);
+            dq[s] = fma(v, qv[i], dq[s]);
+        }
+        ss[s] = subgroupAdd(ss[s]);
+        dq[s] = subgroupAdd(dq[s]);
+    }
+    if (subgroupElect()) {
+        [[unroll]] for (uint s = 0; s < S_MAX; ++s) {
+            red[2*s][gl_SubgroupID]     = ss[s];
+            red[2*s + 1][gl_SubgroupID] = dq[s];
+        }
+    }
+    barrier();
+    const uint nsg = gl_NumSubgroups;
+    const uint lane = gl_SubgroupInvocationID;
+
+    float w[S_MAX];
+    float w_max = -3.402823466e+38;
+    [[unroll]] for (uint s = 0; s < S_MAX; ++s) {
+        const float a = subgroupAdd(lane < nsg ? red[2*s][lane] : 0.0);
+        const float b = subgroupAdd(lane < nsg ? red[2*s + 1][lane] : 0.0);
+        const float r = inversesqrt(a / float(p.n_embd) + p.eps);
+        ss[s] = r;
+        w[s] = s < n_states ? p.scale * r * b : -3.402823466e+38;
+        w_max = max(w_max, w[s]);
+    }
+    float sum = 0.0;
+    [[unroll]] for (uint s = 0; s < S_MAX; ++s) {
+        w[s] = s < n_states ? exp(w[s] - w_max) : 0.0;
+        sum += w[s];
+    }
+    const float inv = 1.0 / sum;
+
+    const uint db = p.d_offset + q*p.nbd1 + t*p.nbd2;
+    [[unroll]] for (uint i = 0; i < NE_MAX; ++i) {
+        float acc = 0.0;
+        [[unroll]] for (uint s = 0; s < S_MAX; ++s) {
+            acc = fma(w[s] * inv * ss[s], x[s][i], acc);
+        }
+        const uint e = tid + i*BLOCK;
+        if (e < p.n_embd) {
+            data_d[db + e] = acc;
+        }
     }
 }

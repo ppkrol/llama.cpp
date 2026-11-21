@@ -1,0 +1,54 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// GGML_OP_CLIP_NORM (local, Inkling 2): one workgroup per row r (x) of token t (y):
+//   d[:, r, t] = T * xs / max(|xs|, T) * tau[t],  xs = x[:, r, t] * s[:, r]   (s, tau optional)
+
+#define BLOCK 64
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n; uint nbx1; uint nbx2; uint nbs1; uint nbd1; uint nbd2;
+    uint x_offset; uint s_offset; uint u_offset; uint d_offset;
+    uint has_s; uint has_tau; float t;
+} p;
+
+layout(binding = 0) readonly  buffer X {float data_x[];};
+layout(binding = 1) readonly  buffer S {float data_s[];};
+layout(binding = 2) readonly  buffer U {float data_u[];};
+layout(binding = 3) writeonly buffer D {float data_d[];};
+
+shared float sums[BLOCK];
+
+void main() {
+    const uint r   = gl_WorkGroupID.x;
+    const uint tok = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint xb = p.x_offset + r*p.nbx1 + tok*p.nbx2;
+    const uint sb = p.s_offset + r*p.nbs1;
+    const uint db = p.d_offset + r*p.nbd1 + tok*p.nbd2;
+
+    float sum = 0.0;
+    for (uint i = tid; i < p.n; i += BLOCK) {
+        const float v = data_x[xb + i] * (p.has_s != 0 ? data_s[sb + i] : 1.0);
+        sum += v*v;
+    }
+    sums[tid] = sum;
+    barrier();
+    [[unroll]] for (uint s = BLOCK/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sums[tid] += sums[tid + s];
+        }
+        barrier();
+    }
+
+    const float scale = p.t / max(sqrt(sums[0]), p.t) * (p.has_tau != 0 ? data_u[p.u_offset + tok] : 1.0);
+
+    for (uint i = tid; i < p.n; i += BLOCK) {
+        const float v = data_x[xb + i] * (p.has_s != 0 ? data_s[sb + i] : 1.0);
+        data_d[db + i] = v * scale;
+    }
+}

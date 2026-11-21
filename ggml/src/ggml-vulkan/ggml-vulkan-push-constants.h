@@ -200,6 +200,31 @@ struct vk_op_fwht_push_constants {
     float scale;
 };
 
+struct vk_op_rel_mask_push_constants {
+    uint32_t n_kv; uint32_t n_q; uint32_t n_h; uint32_t h0; uint32_t n_rows;
+    uint32_t nbt1; uint32_t nbt2; uint32_t nbi1; uint32_t nbm1; uint32_t nbd1; uint32_t nbd2;
+    uint32_t t_offset; uint32_t i_offset; uint32_t m_offset; uint32_t d_offset;
+    uint32_t nbt0; uint32_t nbs1; uint32_t s_offset; uint32_t has_sink;
+};
+
+struct vk_op_clip_norm_push_constants {
+    uint32_t n; uint32_t nbx1; uint32_t nbx2; uint32_t nbs1; uint32_t nbd1; uint32_t nbd2;
+    uint32_t x_offset; uint32_t s_offset; uint32_t u_offset; uint32_t d_offset;
+    uint32_t has_s; uint32_t has_tau; float t;
+};
+
+struct vk_op_conv_step_push_constants {
+    uint32_t C; uint32_t n_conv; uint32_t nbp1; uint32_t nbw1; uint32_t head_dim; uint32_t nbdyn1;
+    uint32_t p_offset; uint32_t x_offset; uint32_t w_offset; uint32_t y_offset; uint32_t r_offset; uint32_t c_offset; uint32_t d_offset;
+    uint32_t has_dyn; uint32_t has_res; float scale; float x_res;
+};
+
+struct vk_op_loop_down_push_constants {
+    uint32_t n; uint32_t nbx1; uint32_t nbm1; uint32_t nbw1; uint32_t nbd1;
+    uint32_t x_offset; uint32_t m_offset; uint32_t w_offset; uint32_t d_offset;
+    float eps;
+};
+
 struct vk_op_loop_gate_push_constants {
     uint32_t r; uint32_t n; uint32_t n_tokens;
     uint32_t nbh1; uint32_t nbg1; uint32_t nbf1; uint32_t nbc1; uint32_t nbm1; uint32_t nbd1;

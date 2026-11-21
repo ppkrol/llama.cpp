@@ -1101,6 +1101,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "TOP_K_MASK",
     "DEPTH_MIX",
     "LOOP_GATE",
+    "REL_MASK",
+    "CLIP_NORM",
+    "CONV_STEP",
+    "LOOP_DOWN",
 
     "UNARY",
 
@@ -1120,7 +1124,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,6 +1222,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "depth_mix(query, cur, blocks)",
     "loop_gate(h, gain, forget, cur, msg)",
+    "rel_mask(table, idx, mask)",
+    "clip_norm(x, s, tau)",
+    "conv_step(past, x, w, dyn, res, cell)",
+    "loop_down(x, m, w)",
 
     "unary(x)",
 
@@ -1237,7 +1245,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1276,9 +1284,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "GEGLU_ERF",
     "GEGLU_QUICK",
     "SWIGLU_CLAMP",
+    "SITU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
+static_assert(GGML_GLU_OP_COUNT == 8, "GGML_GLU_OP_COUNT != 8");
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
 static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
@@ -3115,6 +3124,20 @@ struct ggml_tensor * ggml_swiglu_oai(
     struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU_OAI, false);
     ggml_set_op_params_f32(result, 2, alpha);
     ggml_set_op_params_f32(result, 3, limit);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_situ_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 beta,
+        float                 linear_beta) {
+    GGML_ASSERT(beta > 0.0f);
+    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SITU, false);
+    ggml_set_op_params_f32(result, 2, beta);
+    ggml_set_op_params_f32(result, 3, linear_beta);
 
     return result;
 }
@@ -6454,6 +6477,160 @@ struct ggml_tensor * ggml_depth_mix(
     result->src[0] = query;
     result->src[1] = cur;
     result->src[2] = blocks;
+
+    return result;
+}
+
+// ggml_rel_mask
+
+struct ggml_tensor * ggml_rel_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * mask,
+        int                   h0,
+        int                   n_h) {
+    return ggml_rel_mask_sink(ctx, table, idx, mask, NULL, h0, n_h);
+}
+
+struct ggml_tensor * ggml_rel_mask_sink(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * sink,
+        int                   h0,
+        int                   n_h) {
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && table->nb[0] % sizeof(float) == 0 && table->nb[1] % sizeof(float) == 0);
+    GGML_ASSERT(idx->type == GGML_TYPE_I32 && idx->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
+
+    const int64_t n_kv = idx->ne[0];
+    const int64_t n_q  = idx->ne[1];
+
+    GGML_ASSERT(h0 >= 0 && n_h > 0 && h0 + n_h <= table->ne[0]);
+    GGML_ASSERT(table->ne[2] == n_q && table->ne[3] == 1);
+    GGML_ASSERT(idx->ne[2] == 1 && idx->ne[3] == 1);
+    GGML_ASSERT(mask->ne[0] == n_kv && mask->ne[1] == n_q && mask->ne[2] == 1 && mask->ne[3] == 1);
+    if (sink) {
+        GGML_ASSERT(sink->type == GGML_TYPE_F32 && sink->nb[0] == sizeof(float));
+        GGML_ASSERT(sink->ne[0] == table->ne[0] && sink->ne[1] == n_q && sink->ne[2] == 1 && sink->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_kv, n_q, n_h);
+
+    ggml_set_op_params_i32(result, 0, h0);
+    ggml_set_op_params_i32(result, 1, n_h);
+
+    result->op     = GGML_OP_REL_MASK;
+    result->src[0] = table;
+    result->src[1] = idx;
+    result->src[2] = mask;
+    result->src[3] = sink;
+
+    return result;
+}
+
+// ggml_clip_norm
+
+struct ggml_tensor * ggml_clip_norm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * tau,
+        float                 t) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[3] == 1);
+    GGML_ASSERT(t > 0.0f);
+    if (s) {
+        GGML_ASSERT(s->type == GGML_TYPE_F32 && ggml_is_contiguous(s));
+        GGML_ASSERT(s->ne[0] == x->ne[0] && s->ne[1] == x->ne[1] && s->ne[2] == 1 && s->ne[3] == 1);
+    }
+    if (tau) {
+        GGML_ASSERT(tau->type == GGML_TYPE_F32 && ggml_is_contiguous(tau) && ggml_nelements(tau) == x->ne[2]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2]);
+
+    ggml_set_op_params_f32(result, 0, t);
+
+    result->op     = GGML_OP_CLIP_NORM;
+    result->src[0] = x;
+    result->src[1] = s;
+    result->src[2] = tau;
+
+    return result;
+}
+
+// ggml_conv_step
+
+struct ggml_tensor * ggml_conv_step(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * past,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * dyn,
+        struct ggml_tensor  * res,
+        struct ggml_tensor  * cell,
+        float                 scale,
+        float                 x_res) {
+    const int64_t n_conv = w->ne[0];
+    const int64_t C      = w->ne[1];
+
+    GGML_ASSERT(n_conv >= 2 && n_conv <= 8);
+    GGML_ASSERT(past->type == GGML_TYPE_F32 && past->nb[0] == sizeof(float) && past->ne[0] == n_conv - 1 && past->ne[1] == C);
+    GGML_ASSERT(ggml_nrows(past) == C);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && ggml_nelements(x) == C);
+    GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w));
+    GGML_ASSERT(cell->type == GGML_TYPE_F32 && ggml_is_contiguous(cell) && ggml_nelements(cell) == (n_conv - 1)*C);
+    if (dyn) {
+        GGML_ASSERT(dyn->type == GGML_TYPE_F32 && dyn->nb[0] == sizeof(float) && dyn->ne[0] == n_conv);
+        GGML_ASSERT(C % dyn->ne[1] == 0 && ggml_nrows(dyn) == dyn->ne[1]);
+    }
+    if (res) {
+        GGML_ASSERT(res->type == GGML_TYPE_F32 && ggml_is_contiguous(res) && ggml_nelements(res) == C);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, 1);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_f32(result, 1, x_res);
+
+    result->op     = GGML_OP_CONV_STEP;
+    result->src[0] = past;
+    result->src[1] = x;
+    result->src[2] = w;
+    result->src[3] = dyn;
+    result->src[4] = res;
+    result->src[5] = cell;
+
+    return result;
+}
+
+// ggml_loop_down
+
+struct ggml_tensor * ggml_loop_down(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * m,
+        struct ggml_tensor  * w,
+        float                 eps) {
+    const int64_t n     = x->ne[0];
+    const int64_t n_tok = x->ne[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && m->nb[0] == sizeof(float) && ggml_is_contiguous(w));
+    GGML_ASSERT(ggml_n_dims(x) <= 2 && ggml_n_dims(m) <= 2 && m->ne[0] == n && m->ne[1] == n_tok);
+    GGML_ASSERT(w->ne[0] == 2*n && w->ne[2] == 1 && w->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[1], n_tok);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_LOOP_DOWN;
+    result->src[0] = x;
+    result->src[1] = m;
+    result->src[2] = w;
 
     return result;
 }

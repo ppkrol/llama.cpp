@@ -1,0 +1,179 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#if USE_SUBGROUP_ADD || USE_SUBGROUP_ADD_NO_SHMEM
+#extension GL_KHR_shader_subgroup_clustered : require
+#endif
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// local (Inkling 2 Mini): dedicated NVFP4 mat-vec, no lookup tables.
+// LPR lanes share a set of NUM_ROWS rows; each lane takes whole 16-element sub-blocks
+// (2 qs words + the scale word), so a workgroup covers (BLOCK_SIZE / LPR) * NUM_ROWS rows (host: wg_denoms).
+// e2m1 nibble s.e.e.m -> f16 bits s<<15 | eem<<9 = value * 2^-14 (exact, the 0.5 subnormal included);
+// ue4m3 scale byte -> f16 bits (b & 0x7F) << 7 = value * 2^-8 (0x7F = 0, like the reference).
+// The kvalues convention (doubled e2m1, scale * 0.5) cancels, so the result is sum * 2^22.
+#define LPR 16
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+// local: packed 16-bit decode, 3 instructions per pair (the 32-bit masks took 4): nibble k (0..3) of both 16-bit
+// halves of w is shifted to the top of its half (s at bit 15), shifted right arithmetically by 3 (eem lands on
+// bits 11..9, s fills 14..12) and masked to s + eem. FP4X2(w, S) keeps the old name: S = 4k.
+vec2 fp4x2(const uint w, const int k) {
+    i16vec2 x = i16vec2(unpack16(w));
+    if (k != 3) {
+        x = x << int16_t(12 - 4*k);
+    }
+    x = (x >> int16_t(3)) & int16_t(0x8E00);
+    return vec2(int16BitsToFloat16(x));
+}
+#define FP4X2(w, S) fp4x2(w, (S) / 4)
+
+void write_row(const uint j, const uint n, const uint first_row, const uint d_offset, FLOAT_TYPE v) {
+#ifdef MUL_MAT_ID
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+        v += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0) != 0) {
+        const uint expert_i0 = gl_GlobalInvocationID.y;
+        v *= FLOAT_TYPE(data_fuse0[expert_i0]);
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE0_ID) != 0) {
+        v *= FLOAT_TYPE(data_fuse0[expert_id]);
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
+        const uint expert_i0 = gl_GlobalInvocationID.y;
+        v *= FLOAT_TYPE(data_fuse1[expert_i0]);
+    }
+    if (expert_skip) {
+        v = FLOAT_TYPE(0);
+    }
+#else
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+        v += FLOAT_TYPE(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]);
+    }
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+        v += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
+    }
+#endif
+    data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(v);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint l = tid % LPR;
+    const uint first_row = (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z) * ((gl_WorkGroupSize.x / LPR) * NUM_ROWS)
+                         + (tid / LPR) * NUM_ROWS;
+    // rows past the end are computed on the last row (keeps every lane in step) and not written
+    const uint num_rows = first_row >= p.stride_d ? 0 : min(NUM_ROWS, p.stride_d - first_row);
+
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint nsub = p.ncols / 16;
+    const uint blocks_per_row = p.ncols / QUANT_K;
+
+    uint row_base[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        row_base[n] = a_offset + min(first_row + n, p.stride_d - 1) * blocks_per_row;
+    }
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0);
+        }
+    }
+
+    // (unrolling 2-3 sub-blocks per pass for more loads in flight measured slower: 104.8 vs 106.7 tok/s)
+    for (uint s = l; s < nsub; s += LPR) {
+        const uint ib = s >> 2;
+        const uint sb = s & 3;
+
+        vec4 b[NUM_COLS][4];
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint bo = (j*p.batch_stride_b + b_offset + s*16) / 4;
+            [[unroll]] for (uint q = 0; q < 4; ++q) {
+                b[j][q] = vec4(data_b_v4[bo + q]);
+            }
+        }
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint ibi = row_base[n] + ib;
+            const uint db = (data_a_packed32[ibi].d[0] >> (8*sb)) & 0xFFu;
+            const uint w0 = data_a_packed32[ibi].qs[2*sb];
+            const uint w1 = data_a_packed32[ibi].qs[2*sb + 1];
+            const float d = db == 0x7Fu ? 0.0 : unpackHalf2x16((db & 0x7Fu) << 7).x;
+
+            // byte k of the sub-block: low nibble = element k, high nibble = element k + 8
+            const vec2 e02   = FP4X2(w0, 0);
+            const vec2 e13   = FP4X2(w0, 8);
+            const vec2 e46   = FP4X2(w1, 0);
+            const vec2 e57   = FP4X2(w1, 8);
+            const vec2 e810  = FP4X2(w0, 4);
+            const vec2 e911  = FP4X2(w0, 12);
+            const vec2 e1214 = FP4X2(w1, 4);
+            const vec2 e1315 = FP4X2(w1, 12);
+
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                float sum = e02.x * b[j][0].x;
+                sum = fma(e13.x,   b[j][0].y, sum);
+                sum = fma(e02.y,   b[j][0].z, sum);
+                sum = fma(e13.y,   b[j][0].w, sum);
+                sum = fma(e46.x,   b[j][1].x, sum);
+                sum = fma(e57.x,   b[j][1].y, sum);
+                sum = fma(e46.y,   b[j][1].z, sum);
+                sum = fma(e57.y,   b[j][1].w, sum);
+                sum = fma(e810.x,  b[j][2].x, sum);
+                sum = fma(e911.x,  b[j][2].y, sum);
+                sum = fma(e810.y,  b[j][2].z, sum);
+                sum = fma(e911.y,  b[j][2].w, sum);
+                sum = fma(e1214.x, b[j][3].x, sum);
+                sum = fma(e1315.x, b[j][3].y, sum);
+                sum = fma(e1214.y, b[j][3].z, sum);
+                sum = fma(e1315.y, b[j][3].w, sum);
+                temp[j][n] = fma(FLOAT_TYPE(sum), FLOAT_TYPE(d), temp[j][n]);
+            }
+        }
+    }
+
+#if USE_SUBGROUP_ADD || USE_SUBGROUP_ADD_NO_SHMEM
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = subgroupClusteredAdd(temp[j][n], LPR);
+        }
+    }
+#else
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            tmpsh[j][n][tid] = temp[j][n];
+        }
+    }
+    barrier();
+    if (l == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                FLOAT_TYPE t = FLOAT_TYPE(0);
+                [[unroll]] for (uint i = 0; i < LPR; ++i) {
+                    t += tmpsh[j][n][tid + i];
+                }
+                temp[j][n] = t;
+            }
+        }
+    }
+#endif
+
+    if (l == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (n < num_rows) {
+                    write_row(j, n, first_row, d_offset, temp[j][n] * FLOAT_TYPE(4194304.0));
+                }
+            }
+        }
+    }
+}

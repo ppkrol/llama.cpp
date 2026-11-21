@@ -220,7 +220,8 @@ void init_indices()
     // "p.gqa_ratio >> 16" is just a roundabout way of writing zero
     // that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
-    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+    // local: a mask with one plane per head (nem2 > 1) gives each head of the group its own plane
+    m_stride = (p.gqa_ratio > 1) ? ((p.nem2 > 1) ? p.nem1 * KV : (p.gqa_ratio >> 16)) : KV;
 
     // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
     // partitions the n_kv_max blocks.

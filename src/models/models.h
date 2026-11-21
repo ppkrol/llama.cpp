@@ -2505,7 +2505,7 @@ struct llama_model_inkling2 : public llama_model_base {
         graph(const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
         std::map<std::vector<ggml_tensor *>, ggml_tensor *> mix_stacks; // stacked blocks, built once per block list
-        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, ggml_tensor * tau = nullptr);
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const llama_layer & layer, int module);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
@@ -2514,7 +2514,8 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * state,
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
-                int64_t offset);
+                int64_t offset,
+                ggml_tensor * res = nullptr);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

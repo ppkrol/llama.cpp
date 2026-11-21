@@ -1,0 +1,67 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// GGML_OP_CONV_STEP (local, Inkling 2): one token of a causal short convolution, one thread per channel c:
+//   xc = [past[0..n_conv-2, c], x[c]]
+//   d[c]  = scale*(x_res*x[c] + sum_k (w[k, c] + dyn[n_conv-1-k, c/head_dim])*xc[k]) + res[c]
+//   cell[0..n_conv-2, c] = xc[1..n_conv-1]   (the state for the next token)
+
+#define BLOCK 256
+#define MAX_CONV 8
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint C; uint n_conv; uint nbp1; uint nbw1; uint head_dim; uint nbdyn1;
+    uint p_offset; uint x_offset; uint w_offset; uint y_offset; uint r_offset; uint c_offset; uint d_offset;
+    uint has_dyn; uint has_res; float scale; float x_res;
+} p;
+
+layout(binding = 0) readonly  buffer P {float data_p[];};
+layout(binding = 1) readonly  buffer X {float data_x[];};
+layout(binding = 2) readonly  buffer W {float data_w[];};
+layout(binding = 3) readonly  buffer Y {float data_y[];};
+layout(binding = 4) readonly  buffer R {float data_r[];};
+layout(binding = 5)           buffer S {float data_c[];};
+layout(binding = 6) writeonly buffer D {float data_d[];};
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= p.C) {
+        return;
+    }
+
+    float xc[MAX_CONV];
+    [[unroll]] for (uint k = 0; k < MAX_CONV; ++k) {
+        if (k + 1 < p.n_conv) {
+            xc[k] = data_p[p.p_offset + c*p.nbp1 + k];
+        } else if (k + 1 == p.n_conv) {
+            xc[k] = data_x[p.x_offset + c];
+        }
+    }
+
+    const uint h = p.has_dyn != 0 ? c / p.head_dim : 0;
+    float acc = 0.0;
+    [[unroll]] for (uint k = 0; k < MAX_CONV; ++k) {
+        if (k < p.n_conv) {
+            float wk = data_w[p.w_offset + c*p.nbw1 + k];
+            if (p.has_dyn != 0) {
+                wk += data_y[p.y_offset + h*p.nbdyn1 + (p.n_conv - 1 - k)];
+            }
+            acc += wk * xc[k];
+        }
+    }
+
+    float o = p.scale * (p.x_res * xc[p.n_conv - 1] + acc);
+    if (p.has_res != 0) {
+        o += data_r[p.r_offset + c];
+    }
+    data_d[p.d_offset + c] = o;
+
+    [[unroll]] for (uint k = 0; k + 1 < MAX_CONV; ++k) {
+        if (k + 1 < p.n_conv) {
+            data_c[p.c_offset + c*(p.n_conv - 1) + k] = xc[k + 1];
+        }
+    }
+}

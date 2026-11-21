@@ -1,0 +1,40 @@
+#version 450
+
+#include "types.glsl"
+
+// GGML_OP_REL_MASK: the per-head attention mask of a relative-position bias, straight in F16:
+//   d[k, q, h] = mask[k, q] + table[h0 + h, idx[k, q], q] - sink[h0 + h, q] (sink optional)
+// one thread per key k, workgroup y = query q, z = head h
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n_kv; uint n_q; uint n_h; uint h0; uint n_rows;
+    uint nbt1; uint nbt2; uint nbi1; uint nbm1; uint nbd1; uint nbd2;
+    uint t_offset; uint i_offset; uint m_offset; uint d_offset;
+    uint nbt0; uint nbs1; uint s_offset; uint has_sink;
+} p;
+
+layout(binding = 0) readonly  buffer T {float     data_t[];};
+layout(binding = 1) readonly  buffer I {int       data_i[];};
+#if defined(MASK_F16)
+layout(binding = 2) readonly  buffer M {float16_t data_m[];};
+#else
+layout(binding = 2) readonly  buffer M {float     data_m[];};
+#endif
+layout(binding = 3) writeonly buffer D {float16_t data_d[];};
+layout(binding = 4) readonly  buffer S {float     data_s[];};
+
+void main() {
+    const uint k = gl_GlobalInvocationID.x;
+    const uint q = gl_WorkGroupID.y;
+    const uint h = gl_WorkGroupID.z;
+    if (k >= p.n_kv) {
+        return;
+    }
+    const int  r = clamp(data_i[p.i_offset + q*p.nbi1 + k], 0, int(p.n_rows) - 1);
+    const float m = float(data_m[p.m_offset + q*p.nbm1 + k]);
+    const float b = data_t[p.t_offset + (p.h0 + h)*p.nbt0 + uint(r)*p.nbt1 + q*p.nbt2];
+    const float s = p.has_sink != 0 ? data_s[p.s_offset + (p.h0 + h) + q*p.nbs1] : 0.0f;
+    data_d[p.d_offset + k + q*p.nbd1 + h*p.nbd2] = float16_t(m + (b - s));
+}

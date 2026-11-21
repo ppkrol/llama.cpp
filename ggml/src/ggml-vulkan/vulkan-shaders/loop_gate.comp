@@ -36,6 +36,13 @@ void main() {
     const uint i    = gl_WorkGroupID.x * (BLOCK / LANES) + tid / LANES;
     const uint lane = tid % LANES;
 
+    // local: cur and msg are loaded up front (they were loaded after the reduction: one more round trip)
+    float c = 0.0;
+    float m = 0.0;
+    if (lane == 0 && i < p.n) {
+        c = data_c[p.c_offset + t*p.nbc1 + i];
+        m = data_m[p.m_offset + t*p.nbm1 + i];
+    }
     for (uint j = tid; j < p.r; j += BLOCK) {
         hs[j] = data_h[p.h_offset + t*p.nbh1 + j];
     }
@@ -58,8 +65,6 @@ void main() {
     }
 
     if (lane == 0 && i < p.n) {
-        const float c = data_c[p.c_offset + t*p.nbc1 + i];
-        const float m = data_m[p.m_offset + t*p.nbm1 + i];
         data_d[p.d_offset + t*p.nbd1 + i] = (1.0 - safe_tanh(f)) * c + safe_tanh(g) * m;
     }
 }

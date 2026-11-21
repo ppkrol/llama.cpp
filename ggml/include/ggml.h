@@ -417,6 +417,10 @@ extern "C" {
         GGML_OP_TOP_K_MASK,
         GGML_OP_DEPTH_MIX,
         GGML_OP_LOOP_GATE,
+        GGML_OP_REL_MASK,
+        GGML_OP_CLIP_NORM,
+        GGML_OP_CONV_STEP,
+        GGML_OP_LOOP_DOWN,
 
         GGML_OP_UNARY,
 
@@ -473,6 +477,7 @@ extern "C" {
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
         GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_SITU,  // local (Inkling 2)
 
         GGML_GLU_OP_COUNT,
     };
@@ -1199,6 +1204,14 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 alpha,
             float                 limit);
+
+    // local (Inkling 2): beta*tanh(a/beta)*sigmoid(a) * (linear_beta > 0 ? linear_beta*tanh(b/linear_beta) : b)
+    GGML_API struct ggml_tensor * ggml_situ_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 beta,
+            float                 linear_beta);
 
     GGML_API struct ggml_tensor * ggml_swiglu_clamp(
             struct ggml_context * ctx,
@@ -2484,6 +2497,65 @@ extern "C" {
             struct ggml_tensor  * forget,
             struct ggml_tensor  * cur,
             struct ggml_tensor  * msg);
+
+    // relative-position bias mask (inkling2), in F16 for flash attention:
+    //   result[k, q, h] = mask[k, q] + table[h0 + h, idx[k, q], q]   for h in [0, n_h)
+    // table F32 [n_head, n_rows, n_q], idx I32 [n_kv, n_q], mask F16/F32 [n_kv, n_q] -> F16 [n_kv, n_q, n_h]
+    GGML_API struct ggml_tensor * ggml_rel_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * idx,
+            struct ggml_tensor  * mask,
+            int                   h0,
+            int                   n_h);
+
+    // the same, minus a sink logit per head and query: result[k, q, h] -= sink[h0 + h, q] (sink F32 [n_head, n_q] or NULL);
+    // the table may be a permuted view (any element stride along the heads)
+    // local (Inkling 2): clip each row to an L2 norm of at most t, after an optional per-channel scale and before an
+    // optional per-token factor: y[:, r, k] = t*xs/max(|xs|, t)*tau[k], xs = x[:, r, k]*s[:, r]
+    // x F32 [n, n_rows, n_tok] (rows contiguous), s F32 [n, n_rows] or NULL, tau F32 [1, 1, n_tok] or NULL
+    GGML_API struct ggml_tensor * ggml_clip_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * tau,
+            float                 t);
+
+    // local (Inkling 2): one token of a causal short convolution that also writes the next state (a side effect):
+    //   xc = [past[:, c]; x[c]],  result[c] = scale*(x_res*x[c] + sum_k (w[k, c] + dyn[n_conv-1-k, c/head_dim])*xc[k]) + res[c]
+    //   cell[:, c] = xc[1:]
+    // past F32 [n_conv-1, C] (rows contiguous), x F32 [C], w F32 [n_conv, C], dyn F32 [n_conv, n_heads] or NULL,
+    // res F32 [C] or NULL, cell F32 [(n_conv-1)*C] (contiguous, e.g. a view of the recurrent state; nothing else in
+    // the graph may read it after this op) -> F32 [C, 1]
+    GGML_API struct ggml_tensor * ggml_conv_step(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * dyn,
+            struct ggml_tensor  * res,
+            struct ggml_tensor  * cell,
+            float                 scale,
+            float                 x_res);
+
+    // local (Inkling 2): the loop controller's down projection of [rms_norm(x); rms_norm(m)] in one op:
+    //   result[j, t] = w[0:n, j] . x[:, t]/rms(x[:, t]) + w[n:2n, j] . m[:, t]/rms(m[:, t])
+    // x, m F32 [n, n_tok] (rows contiguous), w F32 [2n, r] -> F32 [r, n_tok]
+    GGML_API struct ggml_tensor * ggml_loop_down(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * m,
+            struct ggml_tensor  * w,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_rel_mask_sink(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * idx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * sink,
+            int                   h0,
+            int                   n_h);
 
     GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
             struct ggml_context * ctx,

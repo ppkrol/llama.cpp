@@ -1,0 +1,13 @@
+#version 450
+
+#include "glu_head.glsl"
+
+// local (Inkling 2): situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb); alpha = beta, limit = lb (0: up as is)
+// tanh as in unary.comp (no NaN for large inputs)
+float op(float a, float b) {
+    const float act = p.alpha * (1.0f - 2.0f / (exp(2.0f * a / p.alpha) + 1.0f)) / (1.0f + exp(-a));
+    const float up  = p.limit > 0.0f ? p.limit * (1.0f - 2.0f / (exp(2.0f * b / p.limit) + 1.0f)) : b;
+    return act * up;
+}
+
+#include "glu_main.glsl"

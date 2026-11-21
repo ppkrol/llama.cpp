@@ -1557,6 +1557,22 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // local: the same attention, but the per-head mask is made by one REL_MASK op from the bias table and the
+    // distances (no dense F32 bias). When that mask would pass INK_REL_SPLIT_MB (default 256 MB), attention runs
+    // per K/V head group with a mask of its own, so only one group's mask needs memory at a time.
+    // Needs flash attention and one stream.
+    ggml_tensor * build_attn_rel(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,   // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur,   // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur,   // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * table,   // F32 [n_head_q, n_rows, n_tokens]
+            ggml_tensor * rel_pos, // I32 [n_kv, n_tokens]: the table row of each (cell, token)
+            ggml_tensor * sinks,   // [n_head_q]
+                  float   kq_scale,
+                    int   il,
+            ggml_tensor * rel_sink = nullptr) const; // F32 [n_head_q, n_tokens]: subtracted from the table (local)
+
     //
     // pooling
     //

@@ -1,0 +1,103 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// GGML_OP_LOOP_DOWN (local, Inkling 2): one workgroup per output row j (x) of token t (y):
+//   d[j, t] = (w[0:n, j] . x[:, t])/rms(x[:, t]) + (w[n:2n, j] . m[:, t])/rms(m[:, t]),  rms(v) = sqrt(mean(v^2) + eps)
+// = the loop controller's down projection of [rms_norm(x); rms_norm(m)], in one pass
+
+#define BLOCK 256
+
+layout(local_size_x = BLOCK, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint n; uint nbx1; uint nbm1; uint nbw1; uint nbd1;
+    uint x_offset; uint m_offset; uint w_offset; uint d_offset;
+    float eps;
+} p;
+
+layout(binding = 0) readonly  buffer X {float data_x[];};
+layout(binding = 1) readonly  buffer M {float data_m[];};
+layout(binding = 2) readonly  buffer W {float data_w[];};
+layout(binding = 3) writeonly buffer D {float data_d[];};
+
+shared vec4 sums[BLOCK];
+
+void generic_path() {
+    const uint j   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint xb = p.x_offset + t*p.nbx1;
+    const uint mb = p.m_offset + t*p.nbm1;
+    const uint wb = p.w_offset + j*p.nbw1;
+
+    vec4 acc = vec4(0.0); // x.w1, m.w2, x.x, m.m
+    for (uint i = tid; i < p.n; i += BLOCK) {
+        const float xv = data_x[xb + i];
+        const float mv = data_m[mb + i];
+        acc += vec4(xv*data_w[wb + i], mv*data_w[wb + p.n + i], xv*xv, mv*mv);
+    }
+    sums[tid] = acc;
+    barrier();
+    [[unroll]] for (uint s = BLOCK/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sums[tid] += sums[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        const vec4 r = sums[0];
+        data_d[p.d_offset + t*p.nbd1 + j] = r.x*inversesqrt(r.z/float(p.n) + p.eps) + r.y*inversesqrt(r.w/float(p.n) + p.eps);
+    }
+}
+
+// local: decode latency path for n <= NE_MAX*BLOCK: every thread issues all its loads at once (the loop above waited
+// on each iteration's loads in turn: 9 round trips to VRAM for the cold weight row), subgroup sums instead of the
+// 8-step shared-memory tree
+#define NE_MAX 12
+shared vec4 sg_sums[BLOCK / 32];
+
+void main() {
+    if (p.n > NE_MAX * BLOCK) {
+        generic_path();
+        return;
+    }
+    const uint j   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint xb = p.x_offset + t*p.nbx1;
+    const uint mb = p.m_offset + t*p.nbm1;
+    const uint wb = p.w_offset + j*p.nbw1;
+
+    float xv[NE_MAX], mv[NE_MAX], w1[NE_MAX], w2[NE_MAX];
+    [[unroll]] for (uint k = 0; k < NE_MAX; ++k) {
+        const uint i = min(tid + k*BLOCK, p.n - 1);
+        xv[k] = data_x[xb + i];
+        mv[k] = data_m[mb + i];
+        w1[k] = data_w[wb + i];
+        w2[k] = data_w[wb + p.n + i];
+    }
+    vec4 acc = vec4(0.0); // x.w1, m.w2, x.x, m.m
+    [[unroll]] for (uint k = 0; k < NE_MAX; ++k) {
+        if (tid + k*BLOCK < p.n) {
+            acc += vec4(xv[k]*w1[k], mv[k]*w2[k], xv[k]*xv[k], mv[k]*mv[k]);
+        }
+    }
+    acc = subgroupAdd(acc);
+    if (subgroupElect()) {
+        sg_sums[gl_SubgroupID] = acc;
+    }
+    barrier();
+    if (tid == 0) {
+        vec4 r = vec4(0.0);
+        for (uint s = 0; s < gl_NumSubgroups; ++s) {
+            r += sg_sums[s];
+        }
+        data_d[p.d_offset + t*p.nbd1 + j] = r.x*inversesqrt(r.z/float(p.n) + p.eps) + r.y*inversesqrt(r.w/float(p.n) + p.eps);
+    }
+}

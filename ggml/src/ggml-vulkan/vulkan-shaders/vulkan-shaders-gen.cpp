@@ -819,6 +819,19 @@ void process_shaders() {
         }
 #endif
 
+        if (tname == "nvfp4") {
+            // local (Inkling): dedicated NVFP4 mat-vec; the generic one above stays for INK_OLD_NVFP4=1
+            const std::string nv = "mul_mat_vec_nvfp4.comp";
+            for (const std::string sfx : {"", "_subgroup", "_subgroup_no_shmem"}) {
+                std::map<std::string, std::string> red;
+                if (sfx == "_subgroup") red = {{"USE_SUBGROUP_ADD", "1"}};
+                if (sfx == "_subgroup_no_shmem") red = {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}};
+                string_to_spv("mul_mat_vec_nvfp4x_f32_f32" + sfx, nv, merge_maps(merge_maps(base_dict, red), {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
+                string_to_spv("mul_mat_vec_nvfp4x_f16_f32" + sfx, nv, merge_maps(merge_maps(base_dict, red), {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}));
+                string_to_spv("mul_mat_vec_id_nvfp4x_f32_f32" + sfx, nv, merge_maps(merge_maps(base_dict, red), {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
+            }
+        }
+
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
@@ -1005,7 +1018,7 @@ void process_shaders() {
                                      "elu", "xielu", "sgn", "softplus", "step", "round", "ceil", "floor", "trunc"}) {
             string_to_spv(op + "_" + t, "unary.comp", merge_maps(dict, {{"OP", "op_" + op}}));
         }
-        for (const std::string op : {"geglu", "reglu", "swiglu", "swiglu_oai", "swiglu_clamp", "geglu_erf", "geglu_quick"}) {
+        for (const std::string op : {"geglu", "reglu", "swiglu", "swiglu_oai", "swiglu_clamp", "situ", "geglu_erf", "geglu_quick"}) {
             string_to_spv(op + "_" + t, op + ".comp", dict);
         }
         string_to_spv("log_" + t, "log.comp", dict);
@@ -1081,6 +1094,11 @@ void process_shaders() {
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("depth_mix_f32", "depth_mix.comp", {});
     string_to_spv("loop_gate_f32", "loop_gate.comp", {});
+    string_to_spv("clip_norm_f32", "clip_norm.comp", {});
+    string_to_spv("conv_step_f32", "conv_step.comp", {});
+    string_to_spv("loop_down_f32", "loop_down.comp", {});
+    string_to_spv("rel_mask_f16m", "rel_mask.comp", {{"MASK_F16", "1"}});
+    string_to_spv("rel_mask_f32m", "rel_mask.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
     string_to_spv("top_k_mask_f16", "top_k_mask.comp", {{"MASK_TYPE", "uint16_t"}});
@@ -1369,6 +1387,17 @@ void write_output_files() {
         }
     }
 #endif
+
+    // local (Inkling): arrays for the dedicated NVFP4 mat-vec
+    for (const std::string pre : {"mul_mat_vec_nvfp4x_f32_f32", "mul_mat_vec_nvfp4x_f16_f32", "mul_mat_vec_id_nvfp4x_f32_f32"}) {
+        const std::string arr = "arr_dmmv_" + pre.substr(std::string("mul_mat_vec_").size());
+        hdr << "extern const void * " << arr << "_data[3];\n";
+        hdr << "extern const uint64_t " << arr << "_len[3];\n";
+        if (basename(input_filepath) == "mul_mat_vec_nvfp4.comp") {
+            src << "const void * " << arr << "_data[3] = {" << pre << "_data, " << pre << "_subgroup_data, " << pre << "_subgroup_no_shmem_data};\n";
+            src << "const uint64_t " << arr << "_len[3] = {" << pre << "_len, " << pre << "_subgroup_len, " << pre << "_subgroup_no_shmem_len};\n";
+        }
+    }
 
     if (input_filepath == "") {
         write_file_if_changed(target_hpp, hdr.str());
