@@ -4,6 +4,8 @@ This llama.cpp branch runs Thinking Machines' Inkling 2 Mini (26B MoE, 3.4B acti
 
 ## Speed
 
+![Generation speed after each step](docs/inkling/inkling-steps.png)
+
 Generation at batch 1, llama-bench tg64, Inkling-2-Mini-UD-Q4_K_M:
 
 | Step | tok/s |
@@ -22,6 +24,8 @@ Rows up to 84.0 use llama-bench's default f16 cache; the last two use K q8_0 / V
 Through llama-server, short replies, at the 84.0 / 98.7 / 108.9 steps: 81 -> 97 -> 108 tok/s.
 
 At 32k context (tg64 at depth 32768): 71.3 -> 92.5 tok/s. Prompt processing: pp512 2075 tok/s.
+
+![Short vs 32k context](docs/inkling/inkling-context.png)
 
 Long chats: the upstream graph builds the relative-position bias as a dense F32 [n_head, n_kv, n_tokens] tensor (3 GB at 64k), so prompt reading fell off a cliff at ~12k tokens. REL_MASK builds an F16 mask + bias straight from the table: a 75k-token chat is read at ~840 tok/s on average.
 
