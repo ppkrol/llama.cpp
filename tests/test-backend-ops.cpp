@@ -9407,9 +9407,10 @@ struct test_flash_attn_ext : public test_case {
     const int64_t n_kv_max;
     const int64_t q_head_padding;
     const int64_t mask_heads;
+    const bool mask_dense; // local: with mask_heads > 1, a finite bias in every cell (no skipped blocks)
 
     std::string vars() override {
-        return VARS_TO_STR18(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, q_head_padding) + ",mask_heads=" + std::to_string(mask_heads);
+        return VARS_TO_STR18(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, q_head_padding) + ",mask_heads=" + std::to_string(mask_heads) + (mask_dense ? ",mask_dense=1" : "");
     }
 
     double max_nmse_err() override {
@@ -9426,9 +9427,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, int64_t q_head_padding = 0, int64_t mask_heads = 1)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, int64_t q_head_padding = 0, int64_t mask_heads = 1, bool mask_dense = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), q_head_padding(q_head_padding), mask_heads(mask_heads) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), q_head_padding(q_head_padding), mask_heads(mask_heads), mask_dense(mask_dense) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -9530,7 +9531,7 @@ struct test_flash_attn_ext : public test_case {
                                 for (int64_t k = 0; k < t->ne[0]; ++k) {
                                     const int64_t i = ((b*t->ne[2] + h)*t->ne[1] + q)*t->ne[0] + k;
                                     const float bias = 0.125f*((k + 3*q + 5*h + 7*b) % 17 - 8);
-                                    data[i] = ggml_fp32_to_fp16(k < (h + 1)*kv/mask_heads ? bias : -INFINITY);
+                                    data[i] = ggml_fp32_to_fp16(mask_dense || k < (h + 1)*kv/mask_heads ? bias : -INFINITY);
                                 }
                             }
                         }
@@ -11402,6 +11403,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1536, 1, true, true, 0, 0, GGML_PREC_F32,
                                                     GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, 0, 24));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1536, 1, true, true, 0, 0, GGML_PREC_F32,
+                                                    GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, 0, 24, true));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1024, 1, true, true, 0, 0, GGML_PREC_F32,
                                                     GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 24));
     test_cases.emplace_back(new test_conv_step(2304, 4, 0, false));
@@ -14193,10 +14196,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 2.5f));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 256, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 32768, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
-    // local: Inkling 2 decode, 24 Q heads over 8 K/V heads, one mask plane per head, KV-cache layout (permute 0,2,1,3)
+    // local: Inkling 2 decode, 24 Q heads over 8 K/V heads, one mask plane per head, KV-cache layout, dense mask
     for (int64_t kv : {1536, 32768, 131072, 262144}) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32,
-                                                        GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, 0, 24));
+                                                        GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, 0, 24, true));
     }
 
     test_cases.emplace_back(new test_timestep_embedding());
