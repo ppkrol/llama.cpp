@@ -237,6 +237,20 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
             }
         } else {
+            // Inkling local patch: the first GGML_VK_DEVLOCAL_FIRST_MIB MiB of device buffers
+            // (model weights are allocated first) go to plain device-local memory instead of
+            // ReBAR. The AMD Windows driver moves ReBAR allocations above ~19.5 GB to system RAM.
+            static const size_t devlocal_first = [] {
+                const char * e = getenv("GGML_VK_DEVLOCAL_FIRST_MIB");
+                return e ? (size_t) std::stoull(e) * 1024ull * 1024ull : (size_t) 0;
+            }();
+            static size_t devlocal_used = 0;
+            if (devlocal_used < devlocal_first) {
+                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
+                                                           vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                devlocal_used += size;
+                GGML_LOG_INFO("ggml_vulkan: device-local (no ReBAR) buffer %zu MiB, total %zu MiB\n", size >> 20, devlocal_used >> 20);
+            } else
             // use rebar if available, otherwise fallback to device only visible memory
             if (device->allow_sysmem_fallback) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
