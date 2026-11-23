@@ -139,6 +139,6 @@ Podejrzane przyczyny niskiej przepustowosci (do potwierdzenia pomiarami):
 
 | id | FA us @1536 | @32768 | @131072 | @262144 | tg @d131072 | tg @d262144 |
 | -- | --: | --: | --: | --: | --: | --: |
-| base | 15.41 | 87.74 | 370.74 | 742.52 | 68.11 | 54.73 |
+| base | 14.78 | 76.31 | 306.70 | 607.05 | 68.11 | 54.73 |
 
-Base: test-backend-ops perf (mask_heads=24, q8_0/q4_0, nb=1) gives 605 GB/s at 131072 (K+V+mask bytes / time). In-model profile was 489 us at kv 131328, i.e. the standalone case is ~24% faster (see task-1 report); judge changes by tg, not only by perf us.
+Base: test-backend-ops perf cases use the KV-cache layout (permute 0,2,1,3), mask_heads=24, q8_0/q4_0, nb=1: 732 GB/s at 131072 (K+V+mask bytes / time). In-model profile was 489 us at kv 131328, so the standalone case is still ~37% faster (old permute 0,1,2,3 numbers: 371 us at 131072); judge changes by tg, not only by perf us.
