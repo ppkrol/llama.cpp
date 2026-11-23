@@ -142,3 +142,31 @@ Podejrzane przyczyny niskiej przepustowosci (do potwierdzenia pomiarami):
 | base | 15.15 | 84.93 | 359.88 | 713.65 | 68.11 | 54.73 |
 
 Base: test-backend-ops perf cases use the KV-cache layout (permute 0,2,1,3) and a dense mask (mask_dense=1, finite bias in every cell; the earlier lower numbers 307 us at 131072 came from masked-out blocks being skipped), mask_heads=24, q8_0/q4_0, nb=1: 624 GB/s at 131072 (K+V+mask bytes / time). In-model profile was 489 us at kv 131328, so the standalone case is still ~26% faster; judge changes by tg, not only by perf us.
+
+### Task 2: grid Bc x WG x split_mult (decode, gqa 3, kv-cache layout, dense mask)
+
+FA us per run (test-backend-ops perf), base = bc32_wg128_s2. tg re-measured the same session, base moved to 64.56 / 53.59 tok/s (machine state ~5% slower than the 68.11 / 54.73 of Task 1).
+
+| Bc | WG | split | @1536 | @32768 | @131072 | @262144 |
+| -- | -- | -- | --: | --: | --: | --: |
+| 32 | 64 | 1 / 2 / 4 | 15.59 / 13.66 / 16.90 | 149.08 / 98.33 / 81.52 | 714.89 / 478.96 / 375.26 | 1407.86 / 949.34 / 740.93 |
+| 32 | 128 | 1 / 2 / 4 | 12.59 / 13.35 / 18.51 | 111.12 / 85.43 / 80.47 | 485.75 / 359.24 / 389.30 | 958.22 / 711.54 / 788.28 |
+| 32 | 256 | 1 / 2 / 4 | 17.09 / 25.79 / 43.27 | 112.88 / 122.16 / 140.75 | 480.09 / 503.23 / 528.85 | 938.99 / 977.82 / 1056.32 |
+| 64 | 64 | 1 / 2 / 4 | 14.56 / 13.80 / 13.76 | 144.97 / 96.17 / 79.46 | 684.05 / 452.87 / 369.40 | 1353.25 / 892.94 / 732.40 |
+| 64 | 128 | 1 / 2 / 4 | 12.16 / 13.34 / 13.33 | 97.86 / 79.63 / 74.89 | 460.02 / 353.23 / 363.82 | 909.92 / 697.40 / 741.82 |
+| 64 | 256 | 1 / 2 / 4 | 15.94 / 24.92 / 24.85 | 87.10 / 98.10 / 116.11 | 418.91 / 451.95 / 476.76 | 825.69 / 877.77 / 1051.42 |
+| 128 | 64 | 1 / 2 / 4 | 30.04 / 28.69 / 28.63 | 470.16 / 251.22 / 202.94 | 2049.49 / 1253.23 / 1028.45 | 3970.31 / 2494.45 / 1992.33 |
+| 128 | 128 | 1 / 2 / 4 | 12.58 / 12.21 / 12.17 | 100.57 / 80.34 / 87.54 | 476.75 / 368.48 / 441.95 | 937.86 / 725.36 / 859.19 |
+| 128 | 256 | 1 / 2 / 4 | 16.08 / 15.81 / 15.87 | 85.71 / 96.68 / 118.74 | 374.77 / 414.49 / 467.15 | 723.89 / 792.03 / 988.89 |
+
+No combination was invalid (all 27 built and ran). Best perf vs base: bc64_wg128_s2 (-1.7% at 131072, -2.0% at 262144), bc64_wg128_s4 (-12% at 32768 only).
+
+tg64 (llama-bench) for the two shortlisted combos and a base re-check:
+
+| id | tg @d131072 | tg @d262144 |
+| -- | --: | --: |
+| bc32_wg128_s2 (base, re-check) | 64.56 | 53.59 |
+| bc64_wg128_s2 | 64.42 | 50.88 |
+| bc64_wg128_s4 | 64.23 | 52.51 |
+
+Decision: no combination beats base by >= 3% (perf gains <= 2% at the long lengths, tg flat to worse). Code change reverted (INK_FA_DEC_* removed); only the new eval cases (kv 1553 / 32768, mask_heads +-24, both layouts) are kept.

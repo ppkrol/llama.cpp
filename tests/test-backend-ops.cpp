@@ -11401,6 +11401,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                             GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, 0, 1));
         }
     }
+    // local: decode block-size tuning coverage, unaligned (1553) and long (32768) KV, both layouts
+    for (int64_t kv : {1553, 32768}) {
+        for (int64_t mh : {24, -24}) {
+            for (const std::array<int32_t, 4> & perm : {std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3}}) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32,
+                                                                GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, perm, true, false, 0, 0, mh));
+            }
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1536, 1, true, true, 0, 0, GGML_PREC_F32,
                                                     GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, 0, 24));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1536, 1, true, true, 0, 0, GGML_PREC_F32,
