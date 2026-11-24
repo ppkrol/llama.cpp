@@ -11390,7 +11390,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_loop_down(100, 3, 2, false));
     // local: Inkling 2 attention, 24 Q heads over 8 K/V heads, one mask plane per Q head (grouped path)
     for (int64_t kv : {256, 1536, 8192}) {
-        for (int64_t nb : {1, 3}) {
+        for (int64_t nb : {1, 3, 5, 8}) {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32,
                                                             GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, 0, 24));
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32,

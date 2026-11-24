@@ -9561,9 +9561,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // Match the shader's per-split block count so no split is empty.
         const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
         split_k = CEIL_DIV(total_blocks, per_blocks);
-    } else if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * fa_split_mult / (workgroups_x * workgroups_y * workgroups_z);
-    } else if (gqa_ratio <= 1) {
+    } else if (gqa_ratio > 1) {
+        // local: also split 5-8 grouped query rows (speculative verify), not only <= Br; same split_k for <= Br
+        const uint32_t total_wgs_no_split = workgroups_x * workgroups_y * workgroups_z;
+        if (total_wgs_no_split < shader_core_count * fa_split_mult) {
+            split_k = shader_core_count * fa_split_mult / total_wgs_no_split;
+        }
+    } else {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
         if (total_wgs_no_split < shader_core_count * fa_split_mult) {
             split_k = shader_core_count * fa_split_mult / total_wgs_no_split;
