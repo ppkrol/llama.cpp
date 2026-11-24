@@ -16330,15 +16330,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     UNUSED(backend);
 }
 
-void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
+static void ggml_vk_graph_optimize_impl(struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
 {
-    VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
-    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-
-    if (ctx->device->disable_graph_optimize) {
-        return;
-    }
-
     auto const &is_empty = [](const ggml_tensor * node) -> bool {
         return node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
     };
@@ -16723,6 +16716,131 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     // Replace the graph with the new order.
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
+    }
+}
+
+// local: the reorder depends only on the ops and on which tensors each node reads (fusion checks that look at
+// shapes only change speed, compute re-checks fusion). A rebuilt graph with the same links but another token count
+// (speculative verify, re-decode) reuses the cached order instead of the 5-8 ms search over ~6000 nodes.
+struct vk_graph_opt_cache_entry {
+    std::vector<int32_t> sig;
+    std::vector<int32_t> perm;                      // new position -> old node index
+    std::vector<std::pair<int32_t, int32_t>> deps;  // (tensor id, old index of the `until` node)
+};
+
+void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
+{
+    VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    if (ctx->device->disable_graph_optimize) {
+        return;
+    }
+
+    static const bool no_cache = getenv("INK_NO_GRAPH_OPT_CACHE") != nullptr;
+    const int n = graph->n_nodes;
+    if (no_cache || n < 64) {
+        ggml_vk_graph_optimize_impl(graph, params);
+        return;
+    }
+
+    // ids: node index for nodes, -(k+1) for the k-th other tensor in order of first use
+    std::unordered_map<const ggml_tensor *, int32_t> ids;
+    ids.reserve(2 * n);
+    std::vector<ggml_tensor *> ext;
+    for (int i = 0; i < n; ++i) {
+        ids[graph->nodes[i]] = i;
+    }
+    auto const id_of = [&](ggml_tensor * t) -> int32_t {
+        if (t == nullptr) {
+            return INT32_MIN;
+        }
+        auto it = ids.find(t);
+        if (it != ids.end()) {
+            return it->second;
+        }
+        ext.push_back(t);
+        const int32_t id = -(int32_t) ext.size();
+        ids[t] = id;
+        return id;
+    };
+
+    std::vector<int32_t> sig;
+    sig.reserve((size_t) n * (GGML_MAX_SRC + 3) + 1);
+    sig.push_back(n);
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        sig.push_back(node->op);
+        sig.push_back(id_of(node->view_src));
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const int32_t id = id_of(node->src[s]);
+            sig.push_back(id);
+            if (id < 0 && id != INT32_MIN) {
+                sig.push_back(node->src[s]->op);
+            }
+        }
+    }
+
+    static std::mutex cache_mutex;
+    static std::vector<vk_graph_opt_cache_entry> cache;
+    constexpr size_t cache_max = 4;
+
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        for (size_t e = 0; e < cache.size(); ++e) {
+            if (cache[e].sig != sig) {
+                continue;
+            }
+            const std::vector<ggml_tensor *> old(graph->nodes, graph->nodes + n);
+            const vk_graph_opt_cache_entry & ent = cache[e];
+            for (int i = 0; i < n; ++i) {
+                graph->nodes[i] = old[ent.perm[i]];
+            }
+            for (const auto & d : ent.deps) {
+                ggml_tensor * t = d.first >= 0 ? old[d.first] : ext[-d.first - 1];
+                params->add_alloc_dep(params->user_data, t, old[d.second]);
+            }
+            if (e != 0) {
+                std::rotate(cache.begin(), cache.begin() + e, cache.begin() + e + 1);
+            }
+            return;
+        }
+    }
+
+    struct rec_t {
+        ggml_backend_graph_optimize_params * outer;
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> deps;
+    } rec { params, {} };
+    ggml_backend_graph_optimize_params rec_params = {
+        /* .add_alloc_dep = */ [](void * user_data, ggml_tensor * tensor, ggml_tensor * until) {
+            rec_t * r = (rec_t *) user_data;
+            r->deps.emplace_back(tensor, until);
+            r->outer->add_alloc_dep(r->outer->user_data, tensor, until);
+        },
+        /* .user_data     = */ &rec,
+    };
+
+    ggml_vk_graph_optimize_impl(graph, &rec_params);
+
+    vk_graph_opt_cache_entry ent;
+    ent.perm.resize(n);
+    for (int i = 0; i < n; ++i) {
+        ent.perm[i] = ids.at(graph->nodes[i]);
+    }
+    for (const auto & d : rec.deps) {
+        auto it_t = ids.find(d.first);
+        auto it_u = ids.find(d.second);
+        if (it_t == ids.end() || it_u == ids.end() || it_u->second < 0) {
+            return; // a dep we cannot express by index: do not cache this graph
+        }
+        ent.deps.emplace_back(it_t->second, it_u->second);
+    }
+    ent.sig = std::move(sig);
+
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cache.insert(cache.begin(), std::move(ent));
+    if (cache.size() > cache_max) {
+        cache.pop_back();
     }
 }
 
