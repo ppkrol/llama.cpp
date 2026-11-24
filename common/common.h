@@ -415,16 +415,36 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP     ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3  ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH  ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK  ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
-        });
-
-        return needs_rs_seq ? draft.n_max : 0u;
+        uint32_t n = 0;
+        for (const auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR:
+                    n = std::max<uint32_t>(n, draft.n_max);
+                    break;
+                // local: ngram drafts roll back the same way; without it a hybrid model saves a full state checkpoint
+                // (SWA window + recurrent state, ~70 MiB on Inkling 2) before every draft
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                    n = std::max<uint32_t>(n, ngram_mod.n_max);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                    n = std::max<uint32_t>(n, ngram_simple.size_m);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                    n = std::max<uint32_t>(n, ngram_map_k.size_m);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                    n = std::max<uint32_t>(n, ngram_map_k4v.size_m);
+                    break;
+                default:
+                    break;
+            }
+        }
+        return n;
     }
 };
 

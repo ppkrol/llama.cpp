@@ -363,10 +363,11 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     const int64_t n_seqs       = ubatch.n_seqs;
 
     static const bool old_conv = getenv("INK_OLD_CONV") != nullptr;
-    if (!old_conv && n_seq_tokens == 1 && n_seqs == 1 && cparams.n_rs_seq == 0 && weight->type == GGML_TYPE_F32 &&
+    if (!old_conv && n_seq_tokens == 1 && n_seqs == 1 && weight->type == GGML_TYPE_F32 &&
             ggml_is_contiguous(cur) && n_conv <= 8 && (!res || ggml_is_contiguous(res))) {
         // local: one token = one CONV_STEP op (taps, residual, scale, the outer residual add, and the state store)
         // instead of concat + cpy + ssm_conv (+ 4x cont/mul/add + add + scale for the dynamic taps) + add
+        // with n_rs_seq > 0 one token writes rollback slot 0 only, which is this same cell
         const bool folded = !dynamic && inkling2_fold_conv(weight, 1.0f/sqrtf(n_conv + 1));
         ggml_tensor * past = ggml_view_2d(ctx0, history, n_conv - 1, n_channels, history->nb[1], offset*history->nb[1]);
         const size_t cell_offs = (size_t) inp->mctx->get_head()*state->nb[1] + offset*(n_conv - 1)*ggml_element_size(state);
