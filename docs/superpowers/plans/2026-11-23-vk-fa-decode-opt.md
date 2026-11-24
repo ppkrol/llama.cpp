@@ -183,3 +183,19 @@ Same session, base = HEAD rebuilt (t3_base), then the change (mask_direct):
 | mask_direct | 13.86 | 101.20 | 475.96 | 945.10 | 64.88 | 50.53 |
 
 Decision: clear regression (FA +28% at 131072, tg -5.9% / -9.1%), so reverted. Likely cause (not profiled): each lane now issues 6 scattered 2-byte mask loads (the 8 D_split lanes of a column load the same values) instead of 1 coalesced load per thread, and the extra loads sit in front of the K reads every iteration; dropping the barriers did not make up for it. Patch kept outside the repo for reference.
+
+### Task 4: 8-byte row loads for K q8_0 and V q4_0
+
+Change: host flag bits 256 (K) / 512 (V) in Flags, set for AMD non-GCN, FA_SCALAR, gqa_ratio > 1, HSK = HSV = 128, D_split 8, no shmem staging, and 8-byte aligned rows (buffer offset, nb1, nb2, nb3). K q8_0 row (136 B = 17 uvec2): D_split lane l loads uvec2 2l and 2l+1 (lane 7 also 16), gets the next lane's first uvec2 with subgroupShuffle and the block scale from its even neighbor with subgroupShuffleXor (3 shuffles, 2-3 loads per lane instead of 9 u16 loads). V q4_0 row (72 B = 9 uvec2): lane l loads uvec2 l (lane 7 also 8), lanes are remapped to 16 consecutive elements (block l/2, low or high nibbles) with the output index changed to match, 2 xor shuffles + 2 shuffles per row (1-2 loads instead of 12 u16 loads). K and V rows of all columns are loaded at the start of the iteration. Eval: 29/29 OK for `-p "mask_heads=-?24"` (wide path active, flags 770), 35/35 OK for `-p "type_K=q8_0,type_V=q4_0"` (unaligned views fall back to the old path). Full `-o FLASH_ATTN_EXT` with the change: 5728/5728 OK.
+
+Same session, base = HEAD binaries (t4_base), the change via a temporary env mask (K, V, both), base re-check at the end:
+
+| id | FA us @1536 | @32768 | @131072 | @262144 | tg @d131072 | tg @d262144 |
+| -- | --: | --: | --: | --: | --: | --: |
+| t4_base | 13.96 | 83.78 | 358.02 | 706.20 | 68.37 | 55.45 |
+| wide_loads (K+V) | 14.83 | 96.24 | 423.91 | 845.59 | 64.92 | 52.59 |
+| wide_k | 13.25 | 84.57 | 383.87 | 758.57 | 68.25 | 55.38 |
+| wide_v | 13.40 | 86.56 | 429.83 | 849.16 | 66.41 | 53.01 |
+| t4_base2 | 13.09 | 84.26 | 371.45 | 736.67 | 69.11 | - |
+
+Decision: no variant clears +3% tg (K only flat: -0.2% / -0.1%, V only -2.9% / -4.4%, both -5.0% / -5.2%; FA us +7% to +18% at 131072). Reverted. Likely cause (not profiled): fewer load instructions do not help here; the shuffles (ds_bpermute) and the selects add latency on the critical path between the load and the dot, and loading V early holds more registers for the whole iteration. Patch kept outside the repo (wide_loads.patch).
