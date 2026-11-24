@@ -199,3 +199,13 @@ Same session, base = HEAD binaries (t4_base), the change via a temporary env mas
 | t4_base2 | 13.09 | 84.26 | 371.45 | 736.67 | 69.11 | - |
 
 Decision: no variant clears +3% tg (K only flat: -0.2% / -0.1%, V only -2.9% / -4.4%, both -5.0% / -5.2%; FA us +3% to +18% at 131072, the K-only figure depends on which base run it is compared to, the base drifted ~4%). Reverted. Scope of the result: this form (row loads hoisted to the top of the iteration plus shuffles to the consumer lanes) does not help; the hoist and the shuffles were not measured apart, so a just-in-time wide V load is not ruled out. Likely cause (not profiled): the shuffles (ds_bpermute) and selects add latency between the load and the dot, and the hoisted V rows hold more registers for the whole iteration. The patch gates on gqa_ratio > 1 but not N <= 8; tighten that if the idea is retried. Patch kept outside the repo (wide_loads.patch).
+
+### Task 5: summary
+
+Tasks 2-4 were all reverted, so the runtime code on this branch is the same as `inkling2-vulkan` (`git diff b37257220 HEAD -- ggml/ src/` is empty). The A/B in llama-bench and the perplexity check from Task 5 Steps 1-2 are therefore not needed, and INKLING.md is not changed. The branch only adds test cases (Inkling decode FA perf in the KV-cache layout with a dense mask, eval cases for kv 1553 / 32768 and mask_heads +-24) and this record.
+
+What was learned for the decode FA kernel (scalar, gqa 3, q8_0 / q4_0, RDNA3, AMD Windows driver):
+- In the model the kernel takes ~489 us at kv 131328 (~458 GB/s); the standalone perf case is ~360 us (~624 GB/s). The gap was not explained.
+- Block size, workgroup size and split_k are already at the best point (Task 2).
+- The loop is sensitive to load latency: anything that adds instructions or shuffles between the loads and the math made it slower (Tasks 3 and 4). Not tested: a just-in-time wide V load without the hoist, and software prefetch of the next block.
+- tg drifts ~5% between sessions; only same-session comparisons are valid.
