@@ -1462,6 +1462,8 @@ struct vk_fa_tuning_params {
     bool flip;
     bool flip_direct;
     uint32_t limit_occupancy_shmem;
+    // local: grouped heads with several query tokens in one workgroup (rows are (token, head) pairs)
+    bool gqa_mt;
 
     void print() const {
         std::cerr << "path=" << path << " workgroup_size=" << workgroup_size << " subgroup_size=" << subgroup_size <<

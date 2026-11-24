@@ -30,6 +30,8 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 // coopmat1: subgroups own Q rows, O in coopmat accumulators. K/V staged in LDS, or loaded from global memory with FLIP_DIRECT.
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
+// local: grouped heads with several query tokens, row = token * gqa_ratio + head (scalar path only)
+const bool GQA_MT          = (Flags & 256) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -234,6 +236,14 @@ void init_indices()
         start_j = min(split_k_index * per_blocks, total_blocks);
         end_j   = min((split_k_index + 1) * per_blocks, total_blocks);
     }
+}
+
+// local: query token and head of a tile row in the grouped path
+uint32_t row_tok(const uint32_t r) {
+    return GQA_MT ? r / p.gqa_ratio : gqa_iq1;
+}
+uint32_t row_head(const uint32_t r) {
+    return GQA_MT ? r % p.gqa_ratio : r;
 }
 
 // Resolve a linear KV slot to a real column; false for inactive (sparse padding/-1, or dense OOB).

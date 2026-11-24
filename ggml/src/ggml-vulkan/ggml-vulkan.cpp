@@ -1447,7 +1447,8 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
                      (use_sparse        ? 16 : 0) |
                      (params.q_in_regs  ? 32 : 0) |
                      (params.flip       ? 64 : 0) |
-                     (params.flip_direct ? 128 : 0);
+                     (params.flip_direct ? 128 : 0) |
+                     (params.gqa_mt     ? 256 : 0);
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
@@ -9342,6 +9343,33 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         tuning_params = get_fa_tuning_params_scalar(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
     }
 
+    // local: several query tokens over grouped heads (speculative verify): one workgroup per K/V head does all
+    // (token, head) rows, so K/V are read once instead of once per token
+    static const bool no_gqa_mt = getenv("INK_NO_GQA_MT") != nullptr;
+    bool gqa_mt = false;
+    // short KV (SWA layers) stays on the per-token path: at kv 1280 and 8 tokens it was 37 vs 53 us
+    if (!no_gqa_mt && gqa_ratio > 1 && neq1 > 1 && gqa_ratio * neq1 <= 32 && KV >= 4096 && tuning_params.path == FA_SCALAR &&
+        ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->architecture != AMD_GCN) {
+        const uint32_t rows = gqa_ratio * (uint32_t) neq1;
+        vk_fa_tuning_params mt = get_fa_tuning_params_scalar(ctx->device, HSK, HSV, rows, KV, k_type_eff, v_type_eff, f32acc);
+        uint32_t br = 8;
+        while (br < rows) {
+            br *= 2;
+        }
+        // 4 rows per thread and one subgroup per row group; 8 rows per thread (Br 32, row_split 4) spilled: 3x slower
+        mt.block_rows = br;
+        mt.row_split = br / 4;
+        mt.workgroup_size = mt.subgroup_size * mt.row_split;
+        mt.limit_occupancy_shmem = 0;
+        mt.gqa_mt = true;
+        if (ggml_vk_flash_attn_scalar_shmem_support(ctx->device, mt, HSK, HSV, f32acc, k_type_eff, v_type_eff)) {
+            tuning_params = mt;
+            N = rows;
+            workgroups_x = 1;
+            gqa_mt = true;
+        }
+    }
+
     float scale         = 1.0f;
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;
@@ -9366,7 +9394,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         return (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) ||
                (t->nb[1] | t->nb[2] | t->nb[3]) % (4 * sizeof(ggml_fp16_t)) == 0;
     };
-    const bool use_sparse = !disable_sparse && n_kv_max > 0 && mask &&
+    const bool use_sparse = !disable_sparse && !gqa_mt && n_kv_max > 0 && mask &&
                             max_bias == 0.0f && logit_softcap == 0.0f &&
                             (tuning_params.path != FA_COOPMAT2 || (sparse_gather_aligned(k) && sparse_gather_aligned(v))) &&
                             nem0 == KV &&
@@ -9425,7 +9453,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    bool use_mask_opt = mask && !use_sparse && !gqa_mt && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
