@@ -170,3 +170,16 @@ tg64 (llama-bench) for the two shortlisted combos and a base re-check:
 | bc64_wg128_s4 | 64.23 | 52.51 |
 
 Decision: no combination beats base by >= 3% (perf gains <= 2% at the long lengths, tg flat to worse). Code change reverted (INK_FA_DEC_* removed); only the new eval cases (kv 1553 / 32768, mask_heads +-24, both layouts) are kept.
+
+### Task 3: mask in registers, no LDS and no barriers in the decode loop
+
+Change: new path gated by a host flag (Flags bit 256, AMD non-GCN, FA_SCALAR) and `MASK_ENABLE && SHMEM_STAGING == 0 && !USE_SPARSE && !USE_MASK_OPT && p.gqa_ratio > 1`. Each lane read its own `rows_per_thread x cols_per_thread` mask values from `data_m` into `mreg` (rows >= gqa_ratio and cols past KV -> 0) and skipped a block per subgroup with `subgroupAll`; the `masksh` / `tmpsh` / 2 x `barrier()` code stayed for all other paths. Eval: 29/29 OK for `-p "mask_heads=-?24"` (kv 1553, mask_heads -24, both layouts, kv 32768 split_k).
+
+Same session, base = HEAD rebuilt (t3_base), then the change (mask_direct):
+
+| id | FA us @1536 | @32768 | @131072 | @262144 | tg @d131072 | tg @d262144 |
+| -- | --: | --: | --: | --: | --: | --: |
+| t3_base | 13.09 | 88.43 | 371.48 | 731.67 | 68.92 | 55.60 |
+| mask_direct | 13.86 | 101.20 | 475.96 | 945.10 | 64.88 | 50.53 |
+
+Decision: clear regression (FA +28% at 131072, tg -5.9% / -9.1%), so reverted. Likely cause (not profiled): each lane now issues 6 scattered 2-byte mask loads (the 8 D_split lanes of a column load the same values) instead of 1 coalesced load per thread, and the extra loads sit in front of the K reads every iteration; dropping the barriers did not make up for it. Patch kept outside the repo for reference.
