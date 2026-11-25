@@ -209,3 +209,13 @@ What was learned for the decode FA kernel (scalar, gqa 3, q8_0 / q4_0, RDNA3, AM
 - Block size, workgroup size and split_k are at or within 2% of the best point for long context (131072 / 262144); short and mid KV were not tuned (Task 2).
 - The loop is sensitive to load latency: anything that adds instructions or shuffles between the loads and the math made it slower (Tasks 3 and 4). Not tested: a just-in-time wide V load without the hoist, and software prefetch of the next block.
 - tg drifts ~5% between sessions; only same-session comparisons are valid.
+
+### Night 2026-11-25: CPU submit overhead and small follow-ups
+
+- CPU vs GPU: a busy wait added per dispatch (0.5 / 1 / 2 us, ~7 ms extra CPU per token at 2 us) cost only 0.2 / 0.6 / 1.5 ms per token (d0: 107.1 -> 104.7 / 100.8 / 92.5 tok/s). Decode is GPU-bound with several ms of CPU slack, so command buffer reuse would not help. Not pursued.
+- GPU profile of one token at d0 (perf logger, inflated): MUL_MAT_VEC 32%, MUL_MAT_ID_VEC 19%, MUL_MAT_ID_MUL 15%, RMS_NORM_MUL 11%, FA 8%. Expert matmuls run at ~410-440 GB/s. GGML_VK_FORCE_MMVQ / DISABLE_MMVQ: no difference (70.7 / 69.9 vs 71.1 tok/s in the same session).
+- FA split_k for short KV: at least 128 keys per split on AMD (commit 5549909c3). d0 107.2 -> 108.9 tok/s, 4k and 32k unchanged. A plain cap (2 / 4 / 8) or no split below 4096 hurt at 32k (SWA KV ~1280).
+- REL_MASK: one thread does all heads in prompt batches, so the index and base mask are read once (commit cb928ce23). pp1024 @ d32768 974 -> 990, @ d65536 637 -> 664 tok/s. Generation unchanged (one head per workgroup kept for small batches).
+- Prefill profile, 256-token ubatch at d65536: FA 54% (8 per-KV-head calls per layer, ~9.7 TFLOPS), MoE 20%, REL_MASK 11% before the change, dense matmul 10%.
+- Multi-token FA path extended to 9-16 tokens (rows up to 48, Br 64): eval OK, but pp16 @ d32768 215 vs 242 tok/s and pp12 collapsed to 28 tok/s. Reverted, not investigated further.
+- GPU state: some runs at night came out at ~65-71 tok/s instead of ~107 at d0 with unchanged binaries (also the old build); likely a power state with the display off. Only same-session comparisons are valid.
