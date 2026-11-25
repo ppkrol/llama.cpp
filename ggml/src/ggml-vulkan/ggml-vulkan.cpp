@@ -9602,6 +9602,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
 
+    // local: keep at least 128 keys per split; with short KV (SWA layers, short context) the extra splits cost more than
+    // they gain (Inkling decode at depth 0: 107.2 -> 108.9 tok/s, unchanged at 4k and 32k)
+    if (!use_sparse && split_k > 1 && ctx->device->vendor_id == VK_VENDOR_ID_AMD) {
+        split_k = std::min(split_k, std::max(1u, KV / 128));
+    }
+
     if (!use_sparse && split_k > 1) {
         // Try to evenly split KV into split_k chunks, but it needs to be a multiple
         // of "align", so recompute split_k based on that.
@@ -16213,6 +16219,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
