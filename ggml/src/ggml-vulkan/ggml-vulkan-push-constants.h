@@ -205,6 +205,7 @@ struct vk_op_rel_mask_push_constants {
     uint32_t nbt1; uint32_t nbt2; uint32_t nbi1; uint32_t nbm1; uint32_t nbd1; uint32_t nbd2;
     uint32_t t_offset; uint32_t i_offset; uint32_t m_offset; uint32_t d_offset;
     uint32_t nbt0; uint32_t nbs1; uint32_t s_offset; uint32_t has_sink;
+    uint32_t h_per; // local: heads per thread, so the index and the base mask are read once for all of them
 };
 
 struct vk_op_clip_norm_push_constants {

@@ -8092,6 +8092,11 @@ static void ggml_vk_rel_mask(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t n_q  = (uint32_t)idx->ne[1];
     const uint32_t n_h  = (uint32_t)dst->ne[2];
 
+    // local: with many workgroups (prompt batches) one thread does all heads and reads the index and base mask once;
+    // generation keeps one head per workgroup for enough parallelism
+    static const bool ink_rel_h1 = getenv("INK_REL_MASK_H1") != nullptr;
+    const uint32_t h_per = (!ink_rel_h1 && (uint64_t) CEIL_DIV(n_kv, 256u) * n_q >= 4096) ? n_h : 1u;
+
     vk_op_rel_mask_push_constants pc = {
         n_kv, n_q, n_h, (uint32_t)ggml_get_op_params_i32(dst, 0), (uint32_t)table->ne[1],
         ggml_vk_nb_elem(table, 1), ggml_vk_nb_elem(table, 2), ggml_vk_nb_elem(idx, 1), ggml_vk_nb_elem(mask, 1),
@@ -8102,9 +8107,10 @@ static void ggml_vk_rel_mask(ggml_backend_vk_context * ctx, vk_context& subctx, 
         get_misalign_bytes(ctx, dst)   / (uint32_t)ggml_type_size(dst->type),
         ggml_vk_nb_elem(table, 0), sink ? ggml_vk_nb_elem(sink, 1) : 0u,
         sink ? get_misalign_bytes(ctx, sink) / (uint32_t)sizeof(float) : 0u, sink ? 1u : 0u,
+        h_per,
     };
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { t_buf, i_buf, m_buf, d_buf, s_buf }, pc, { n_kv, n_q, n_h });
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { t_buf, i_buf, m_buf, d_buf, s_buf }, pc, { n_kv, n_q, CEIL_DIV(n_h, h_per) });
 }
 
 static void ggml_vk_loop_down(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {

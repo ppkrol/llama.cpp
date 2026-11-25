@@ -11435,6 +11435,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rel_mask(24, 1025, 1000, 1, 21, 3));
     test_cases.emplace_back(new test_rel_mask(24, 1025, 515, 33, 0, 24, GGML_TYPE_F32));
     test_cases.emplace_back(new test_rel_mask(24, 1025, 300, 1, 0, 24, GGML_TYPE_F16, true));
+    // local: prompt-sized batches, where the Vulkan shader does several heads per thread
+    test_cases.emplace_back(new test_rel_mask(24, 1025, 4100, 260, 3, 3));
+    test_cases.emplace_back(new test_rel_mask(24, 1025, 4096, 300, 0, 24, GGML_TYPE_F16, true));
     test_cases.emplace_back(new test_rel_mask(24, 1025, 2048, 64, 3, 3, GGML_TYPE_F16, true));
     test_cases.emplace_back(new test_rel_mask(24, 1025, 515, 33, 0, 24, GGML_TYPE_F32, true));
     test_cases.emplace_back(new test_depth_mix(100, 2, 4, 2));
